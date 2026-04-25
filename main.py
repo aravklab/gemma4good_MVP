@@ -9,7 +9,6 @@ State is managed with plain Python variables — no agent frameworks.
 """
 
 import json
-import random
 import sys
 import requests
 
@@ -321,24 +320,20 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "give_up":
                 # ── Recovery Loop: reveal the answer, offer a retry ──────────
-                # Phase-Aware Generic Escape Hatch with Override
+                # Phase-Aware Generic Escape Hatch
                 if current_phase == 1:
                     ans = concept_data.get("evaluator_ground_truth", "the correct answer")
                     state_directive = (
-                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. You MUST "
-                        f"give them the answer based on this rule: '{ans}'. After explaining "
-                        f"it, you MUST end your response by asking a strict Yes or No question: "
-                        f"'Now that you know the secret, do you want to try explaining it to "
-                        f"me so we can finish?'"
+                        f"The user is frustrated. Tell them the answer clearly based on "
+                        f"this rule: {ans}. Then cheerfully ask if they want to try "
+                        f"explaining it so you can finish your task."
                     )
                 else:
                     ans = concept_data.get("verification_ground_truth", "why your scenario was wrong")
                     state_directive = (
-                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. You MUST "
-                        f"tell them exactly why your scenario was wrong based on this rule: "
-                        f"'{ans}'. After explaining it, you MUST end your response by asking "
-                        f"a strict Yes or No question: 'Now that you know the secret, do you "
-                        f"want to try explaining it to me so we can finish?'"
+                        f"The user is frustrated. Tell them exactly why your scenario was "
+                        f"wrong based on this rule: {ans}. Then cheerfully ask if they want "
+                        f"to try explaining it so you can finish your task."
                     )
                 pip_system = compile_pip_prompt(concept_data, state_directive)
                 print("\n[Pip is thinking...]")
@@ -422,24 +417,20 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "give_up":
                 # ── Recovery Loop: reveal the answer, offer a retry ──────────
-                # Phase-Aware Generic Escape Hatch with Override
+                # Phase-Aware Generic Escape Hatch
                 if current_phase == 1:
                     ans = concept_data.get("evaluator_ground_truth", "the correct answer")
                     state_directive = (
-                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. You MUST "
-                        f"give them the answer based on this rule: '{ans}'. After explaining "
-                        f"it, you MUST end your response by asking a strict Yes or No question: "
-                        f"'Now that you know the secret, do you want to try explaining it to "
-                        f"me so we can finish?'"
+                        f"The user is frustrated. Tell them the answer clearly based on "
+                        f"this rule: {ans}. Then cheerfully ask if they want to try "
+                        f"explaining it so you can finish your task."
                     )
                 else:
                     ans = concept_data.get("verification_ground_truth", "why your scenario was wrong")
                     state_directive = (
-                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. You MUST "
-                        f"tell them exactly why your scenario was wrong based on this rule: "
-                        f"'{ans}'. After explaining it, you MUST end your response by asking "
-                        f"a strict Yes or No question: 'Now that you know the secret, do you "
-                        f"want to try explaining it to me so we can finish?'"
+                        f"The user is frustrated. Tell them exactly why your scenario was "
+                        f"wrong based on this rule: {ans}. Then cheerfully ask if they want "
+                        f"to try explaining it so you can finish your task."
                     )
                 pip_system = compile_pip_prompt(concept_data, state_directive)
                 print("\n[Pip is thinking...]")
@@ -557,18 +548,7 @@ def main() -> None:
 
         # ── Load selected concept and start session ───────────────────────────
         selected_key = concept_keys[int(choice) - 1]
-        concept_data = concepts[selected_key].copy()  # copy so variants don't mutate the source
-
-        # ── Scenario Polymorphism: pick a random variant if available ─────────
-        # Variants override story_intro, verification_scenario, and
-        # verification_ground_truth so the same concept feels fresh each run.
-        # Backwards-compatible: concepts without "variants" are unchanged.
-        if "variants" in concept_data:
-            variant = random.choice(concept_data["variants"])
-            concept_data["story_intro"]               = variant["story_intro"]
-            concept_data["verification_scenario"]     = variant["verification_scenario"]
-            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
-            print(f"\n[Variant] Selected scenario: '{variant.get('variant_name', 'unnamed')}'")
+        concept_data = concepts[selected_key]
 
         print(f"\n[STAGE 2/2] Starting: '{concept_data['name']}' ({selected_key})")
         print("[STAGE 2/2] No Ollama call needed for Turn 0.\n")
