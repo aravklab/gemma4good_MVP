@@ -298,20 +298,39 @@ def run_session(concept_data: dict) -> None:
                 )
 
             elif classification == "off_topic":
-                state_directive = (
-                    "The user is distracted. Acknowledge what they said like a kid would, "
-                    "but immediately pivot back to your current puzzle. Remind them you "
-                    "really need their help to figure this out."
-                )
+                if current_phase == 1:
+                    current_puzzle = concept_data.get("story_intro", "my puzzle")
+                    state_directive = (
+                        f"The user is distracted. Acknowledge what they said like a kid would, "
+                        f"then immediately remind them of your exact problem: '{current_puzzle}'. "
+                        f"Ask them to help you figure it out."
+                    )
+                else:
+                    current_puzzle = concept_data.get("verification_scenario", "my scenario")
+                    state_directive = (
+                        f"The user is distracted. Acknowledge what they said like a kid would, "
+                        f"then immediately remind them of your exact scenario: '{current_puzzle}'. "
+                        f"Ask them if your idea is right or wrong."
+                    )
 
             elif classification == "question":
                 if clarification_counter < 2:
                     clarification_counter += 1
                     print(f"[State] clarification_counter = {clarification_counter}")
-                    state_directive = (
-                        "The user is confused about something you said. Briefly clarify "
-                        "using completely different, simpler words. Do NOT give the answer."
-                    )
+                    if current_phase == 1:
+                        current_puzzle = concept_data.get("story_intro", "my puzzle")
+                        state_directive = (
+                            f"The user asked a question or is confused. Answer them briefly "
+                            f"in character. Then, you MUST remind them of your exact problem: "
+                            f"'{current_puzzle}'. Do not give away the answer."
+                        )
+                    else:
+                        current_puzzle = concept_data.get("verification_scenario", "my scenario")
+                        state_directive = (
+                            f"The user asked a question or is confused. Answer them briefly "
+                            f"in character. Then, you MUST remind them of your exact scenario: "
+                            f"'{current_puzzle}'. Do not give away the answer."
+                        )
                 else:
                     state_directive = (
                         "The user keeps asking questions and you are both going in circles. "
@@ -395,21 +414,39 @@ def run_session(concept_data: dict) -> None:
                 )
 
             elif classification == "off_topic":
-                state_directive = (
-                    "The user is distracted. Acknowledge what they said like a kid would, "
-                    "but immediately pivot back to your current puzzle. Remind them you "
-                    "really need their help to figure this out."
-                )
+                if current_phase == 1:
+                    current_puzzle = concept_data.get("story_intro", "my puzzle")
+                    state_directive = (
+                        f"The user is distracted. Acknowledge what they said like a kid would, "
+                        f"then immediately remind them of your exact problem: '{current_puzzle}'. "
+                        f"Ask them to help you figure it out."
+                    )
+                else:
+                    current_puzzle = concept_data.get("verification_scenario", "my scenario")
+                    state_directive = (
+                        f"The user is distracted. Acknowledge what they said like a kid would, "
+                        f"then immediately remind them of your exact scenario: '{current_puzzle}'. "
+                        f"Ask them if your idea is right or wrong."
+                    )
 
             elif classification == "question":
                 if clarification_counter < 2:
                     clarification_counter += 1
                     print(f"[State] clarification_counter = {clarification_counter}")
-                    state_directive = (
-                        "The user is confused about your roof question. Rephrase it "
-                        "using simpler words. Do NOT reveal whether the roof idea is "
-                        "right or wrong."
-                    )
+                    if current_phase == 1:
+                        current_puzzle = concept_data.get("story_intro", "my puzzle")
+                        state_directive = (
+                            f"The user asked a question or is confused. Answer them briefly "
+                            f"in character. Then, you MUST remind them of your exact problem: "
+                            f"'{current_puzzle}'. Do not give away the answer."
+                        )
+                    else:
+                        current_puzzle = concept_data.get("verification_scenario", "my scenario")
+                        state_directive = (
+                            f"The user asked a question or is confused. Answer them briefly "
+                            f"in character. Then, you MUST remind them of your exact scenario: "
+                            f"'{current_puzzle}'. Do not give away the answer."
+                        )
                 else:
                     state_directive = (
                         "You and the user are both confused. Suggest you draw it out "
