@@ -281,10 +281,10 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "partial_hit":
                 state_directive = (
-                    "The user is getting close. Acknowledge their specific analogy, but "
-                    "YOU MUST IMMEDIATELY ask them to go deeper and explain the core mechanism "
-                    "or logic behind it — not just name it. Ask them to describe exactly how or "
-                    "why it works in their own words."
+                    "The user has part of the right idea, but their explanation is incomplete "
+                    "or a bit vague. Enthusiastically validate what they got right, but ask a "
+                    "guiding question to help them figure out the missing piece of the puzzle. "
+                    "Do not give away the exact answer."
                 )
 
             elif classification == "miss":
@@ -406,9 +406,10 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "partial_hit":
                 state_directive = (
-                    "The user caught part of your mistake, but didn't fully explain why "
-                    "your idea is wrong. Ask them to clarify the specific reason — what "
-                    "would actually happen if your idea was used, and why that's a problem."
+                    "The user has part of the right idea, but their explanation is incomplete "
+                    "or a bit vague. Enthusiastically validate what they got right, but ask a "
+                    "guiding question to help them figure out the missing piece of the puzzle. "
+                    "Do not give away the exact answer."
                 )
 
             elif classification == "miss":
