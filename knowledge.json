@@ -1,0 +1,38 @@
+{
+  "concepts": {
+    "C1_Right_Angle": {
+      "name": "The Book Corner",
+      "story_intro": "I'm trying to build a house out of blocks, but my walls keep falling over. I heard I need to use 'right angles' for the corners. Do you know what those are?",
+      "story_bridge": "Ohhh! So it's just a perfect L shape! That makes so much sense, my block walls won't fall down now. Thank you!",
+      "secret_fact": "A right angle forms a perfect 'L' shape, like the corner of a book or a square.",
+      "goal": "Get the user to explain that a right angle looks like a perfect corner or an L-shape.",
+      "evaluator_ground_truth": "The user must explain that a right angle looks like a perfect corner or an L-shape. Accept childlike analogies.",
+      "verification_scenario": "Okay, I think I get it! So if I want to make the roof of my house perfectly flat like a floor so I can sleep up there, I should use right angles for the top of the roof, right? Since it's a straight L-shape, it will make a flat bed for me?",
+      "verification_ground_truth": "The user must explain that a right angle is a straight 'L' shape, so using it for a roof wouldn't make it flat, it would make a pointy or boxy corner. If she wants a flat roof, a right angle is the wrong shape."
+    },
+    "C3_New_Concept": {
+      "name": "The Earth's Invisible Tug",
+        "secret_fact": "The Earth acts like a giant, invisible magnet that is constantly hugging everything toward its very center.",
+        "goal": "Explain that there is a constant force pulling all objects toward the center of the Earth.",
+        "evaluator_ground_truth": "The user must describe the concept as a physical 'pull' or 'force' directed toward the ground or the Earth's center. If the user merely repeats the word 'gravity' without describing what it physically does, it is a MISS.",
+        "story_bridge": "My big brother says there is a scientific reason why my toys don't just stay where I put them in the air. Can you explain what is actually happening?",
+        "variants": [
+          {
+            "story_intro": "I’m out on the trampoline trying to do a 'moon jump,' but no matter how hard I launch myself, I keep getting snapped back down to the mat. It feels like there is a giant invisible bungee cord tied to my belt that refuses to let me fly away. Why does the ground keep winning the tug-of-war?",
+            "verification_scenario": "Okay, so it's a pull! I think I've got a trick to beat it. If I put on my super-heavy winter boots, they will be so heavy that the ground-pull will get tired of holding onto them and eventually let go, letting me float. That makes sense, right? If I'm too heavy to pull, I'll finally stay up there!",
+            "verification_ground_truth": "Pip is wrong because the force doesn't 'get tired' based on weight. In fact, the Earth pulls harder on heavier things, not less. Adding weight won't make the force stop; it just means there is more stuff for the Earth to pull on."
+          },
+          {
+            "story_intro": "I wanted to decorate my bedroom ceiling with stars, so I threw a bunch of glow-in-the-dark stickers up there. But instead of sticking, they all just zoomed back down and hit me in the face! It’s like the floor is a giant vacuum cleaner sucking everything down. Why won't they just stay up?",
+            "verification_scenario": "I see, so the whole planet is pulling things to its middle! Well, if I climb up to the very top of the tallest slide at the park, I’ll be much further away from the dirt. That means if I drop my ball from up there, it should fall really slowly because I'm further away from the 'vacuum cleaner,' right?",
+            "verification_ground_truth": "Pip is wrong because the distance of a slide is tiny compared to the size of the Earth. To actually feel the pull get weaker, she would have to go thousands of miles into space. At the top of a slide, the pull is just as strong as it is on the ground."
+          },
+          {
+            "story_intro": "I’m trying to build a bridge out of blocks, but every time I try to make a long part without a leg underneath, it just crashes straight down to the rug. It never falls up, and it never just hangs there in the air. It’s like the rug is a magnet for blocks! What is going on?",
+            "verification_scenario": "So it's a constant pull toward the center of the Earth. But wait! I have a helium balloon from my party, and when I let go, it goes UP to the ceiling. Does that mean the 'down-pull' is broken in my house, or does the balloon have a 'reverse-magnet' inside it that makes it hate the floor?",
+            "verification_ground_truth": "Pip is wrong. The pull is still working on the balloon! However, the air around the balloon is heavier and pushes the balloon up (buoyancy), sort of like how a cork pops to the top of a bathtub. The pull is still there, it's just being 'out-pushed' by the air."
+          }
+        ]
+    }
+  }
+}
