@@ -141,12 +141,12 @@ OUTPUT RULES — you must output ONLY valid JSON, nothing else:
 
 Choose exactly ONE value from this list:
 
-  "mastery"     — Student clearly explained the ground truth (childlike language is fine).
-  "partial_hit" — Student mentions shapes, lines, or corners, but the geometric logic is incomplete. CRITICAL: If the student only talks about building materials (e.g., cement, wood, cardboard) or themes without actually describing the physical geometry or shape, you MUST grade it as a "miss".
-  "miss"        — Student is wrong, confused, said they don't know, or described only materials/themes without any geometric explanation.
-  "question"    — Student is asking a clarifying question about the math or puzzle.
-  "off_topic"   — Student is joking, typing nonsense, or talking about something unrelated.
-  "give_up"     — Student explicitly says "I don't know", "tell me", "you explain it", or expresses deep frustration and a desire to quit the current puzzle.
+  "mastery"     — Student clearly explained the core mechanism required by the ground truth. (Childlike language is fine).
+  "partial_hit" — Student mentions relevant ideas or vocabulary, but the explanation is incomplete, vague, or missing the core logical mechanism defined in the ground truth.
+  "miss"        — Student is wrong, confused, guessing blindly, or merely parroting the vocabulary word without explaining how it actually works.
+  "question"    — Student is asking a clarifying question about the concept or the puzzle.
+  "off_topic"   — Student is joking, typing nonsense, or talking about something completely unrelated to the current task.
+  "give_up"     — Student explicitly says "I don't know", "tell me", "you explain it", or expresses deep frustration and a desire to quit the puzzle.
 
 Be strict but fair. Do not guess intent — classify what was actually said.
 IMPORTANT: Only use "give_up" when the student clearly and explicitly surrenders. A wrong answer is still a "miss", not a "give_up".
