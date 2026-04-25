@@ -548,7 +548,18 @@ def main() -> None:
 
         # ── Load selected concept and start session ───────────────────────────
         selected_key = concept_keys[int(choice) - 1]
-        concept_data = concepts[selected_key]
+        concept_data = concepts[selected_key].copy()  # copy so variants don't mutate the source
+
+        # ── Scenario Polymorphism: pick a random variant if available ─────────
+        # Variants override story_intro, verification_scenario, and
+        # verification_ground_truth so the same concept feels fresh each run.
+        # Backwards-compatible: concepts without "variants" are unchanged.
+        if "variants" in concept_data:
+            variant = random.choice(concept_data["variants"])
+            concept_data["story_intro"]               = variant["story_intro"]
+            concept_data["verification_scenario"]     = variant["verification_scenario"]
+            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+            print(f"\n[Variant] Selected scenario: '{variant.get('variant_name', 'unnamed')}'")
 
         print(f"\n[STAGE 2/2] Starting: '{concept_data['name']}' ({selected_key})")
         print("[STAGE 2/2] No Ollama call needed for Turn 0.\n")
