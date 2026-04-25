@@ -45,10 +45,10 @@ These are initialised at the start of every session in `run_session()`:
 Pip presents a story intro and asks the student to explain a concept. The Evaluator grades against `evaluator_ground_truth`.
 
 - `mastery` → instant transition to Phase 2 (no API call; `story_bridge` + `verification_scenario` printed directly)
-- `partial_hit` → Pip asks student to describe the geometry more precisely
+- `partial_hit` → Pip enthusiastically validates what the student got right, then asks a guiding question to find the missing piece
 - `miss` → Pip makes a deliberately wrong binary guess; `frustration_counter` increments
-- `question` → Pip rephrases (max 2 times; then suggests looking at a book together)
-- `off_topic` → Pip redirects to the puzzle
+- `question` → Pip rephrases briefly in character, then **re-states the exact puzzle verbatim** (Context Re-Injection) to prevent context drift; max 2 times, then suggests looking at a book
+- `off_topic` → Pip acknowledges like a kid, then **re-states the exact puzzle verbatim** (Context Re-Injection)
 - `give_up` → **Escape Hatch** (see below)
 
 ### Phase 2 — Verification Boss Fight
@@ -63,7 +63,9 @@ Pip presents a scenario containing a deliberate mistake. The student must catch 
 
 Triggered when the Evaluator returns `"give_up"`:
 
-1. `state_directive` is set to `"OVERRIDE FIREWALL: ..."` — Pip reveals the answer verbatim from the ground truth.
+1. `state_directive` is set to `"OVERRIDE FIREWALL: ..."` — Pip explains the answer in a full paragraph.
+   - Phase 1: uses the `secret_fact` analogy to make the explanation concrete.
+   - Phase 2: uses `verification_ground_truth` to explain exactly why the scenario was wrong.
 2. Pip asks a strict Yes/No question: *"Now that you know the secret, do you want to try explaining it to me so we can finish?"*
 3. A plain Python `input()` intercepts the reply (no AI call needed).
 4. **Yes** → counters reset, phase re-seeded, session continues.
@@ -99,9 +101,9 @@ If a concept has a `variants` array, `main()` uses `random.choice()` to pick one
 
 | Value | Meaning |
 |---|---|
-| `mastery` | Student clearly explained the ground truth |
-| `partial_hit` | Geometric logic mentioned but incomplete |
-| `miss` | Wrong, confused, or no geometric explanation |
+| `mastery` | Student clearly explained the core mechanism required by the ground truth |
+| `partial_hit` | Student mentions relevant ideas or vocabulary but is missing the core logical mechanism |
+| `miss` | Student is wrong, confused, guessing blindly, or parroting vocabulary without explaining how it works |
 | `question` | Student is asking a clarifying question |
 | `off_topic` | Joking, nonsense, or unrelated |
 | `give_up` | Student explicitly surrenders |

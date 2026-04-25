@@ -165,11 +165,11 @@ The six classification states:
 
 | State | Meaning |
 |---|---|
-| `mastery` | Student answered correctly for the current phase |
-| `partial_hit` | Mentions shapes/lines/corners but geometric logic is incomplete. Pure material or theme descriptions (cement, cardboard) with no geometry are forced to `miss` |
-| `miss` | Wrong answer, vague, or described only materials/themes without geometry |
-| `question` | Student asked a clarifying question about the concept |
-| `off_topic` | Joke, nonsense, or unrelated topic |
+| `mastery` | Student clearly explained the core mechanism required by the ground truth (childlike language is fine) |
+| `partial_hit` | Student mentions relevant ideas or vocabulary but the explanation is incomplete, vague, or missing the core logical mechanism |
+| `miss` | Student is wrong, confused, guessing blindly, or merely parroting vocabulary without explaining how it works |
+| `question` | Student asked a clarifying question about the concept or puzzle |
+| `off_topic` | Joke, nonsense, or completely unrelated topic |
 | `give_up` | Student explicitly surrenders ("I don't know", "just tell me", expresses deep frustration). A wrong answer is still `miss` — this only fires on a clear, explicit surrender. Triggers the **Recovery Loop** (see below) |
 
 #### C. `compile_pip_prompt(concept_data, state_directive)`
@@ -207,31 +207,36 @@ Loads `knowledge.json` once, then runs an outer `while True` menu loop:
 | Evaluator verdict | Counter effect | Pip's behaviour |
 |---|---|---|
 | `mastery` | — | Prints `story_bridge`, prints `verification_scenario` verbatim from JSON (zero Ollama latency), sets `current_phase = 2`, `continue`s |
-| `partial_hit` | none | Acknowledges the student's specific analogy, then immediately demands they describe the edges/lines of that object to force geometric reasoning |
+| `partial_hit` | none | Enthusiastically validates what the student got right, then asks a guiding question to help them find the missing piece — never gives the answer |
 | `miss` | `frustration++` | Makes a deliberately wrong binary guess so the student feels smart correcting her |
-| `off_topic` | none | Laughs it off like a kid, immediately pivots back to the puzzle |
-| `question` (1st or 2nd) | `clarification++` | Rephrases with simpler, different words |
+| `off_topic` | none | Acknowledges like a kid, then re-states the exact `story_intro` puzzle verbatim to prevent context drift |
+| `question` (1st or 2nd) | `clarification++` | Answers briefly in character, then re-states the exact `story_intro` puzzle verbatim so context is never lost |
 | `question` (3rd+) | none | "Maybe we should look at a book together" |
-| `give_up` | — | Reveals the full answer warmly, then asks if the student wants to retry. **Yes** → resets counters, re-prints the phase opening line, `continue`s. **No** → `return`s |
+| `give_up` | — | Reveals the full answer warmly using the `secret_fact` analogy, then asks if the student wants to retry. **Yes** → resets counters, re-prints the phase opening line, `continue`s. **No** → `return`s |
 
 **Phase 2 routing:**
 
 | Evaluator verdict | Counter effect | Pip's behaviour |
 |---|---|---|
 | `mastery` | — | Prints `★ TRUE MASTERY ACHIEVED ★` banner and breaks |
-| `partial_hit` | none | Asks student to finish explaining why the roof idea is wrong |
-| `miss` | none (no penalty) | Acts confused, asks if an L-shape really makes a flat roof |
-| `off_topic` | none | Redirects back to the roof question |
-| `question` (1st or 2nd) | `clarification++` | Rephrases the roof question without revealing the answer |
+| `partial_hit` | none | Enthusiastically validates what the student got right, then asks a guiding question to find the missing piece |
+| `miss` | none (no penalty) | Acts confused, asks the student to explain what would actually happen if her scenario idea were used |
+| `off_topic` | none | Acknowledges like a kid, then re-states the exact `verification_scenario` verbatim to prevent context drift |
+| `question` (1st or 2nd) | `clarification++` | Answers briefly in character, then re-states the exact `verification_scenario` verbatim so context is never lost |
 | `question` (3rd+) | none | Suggests drawing it out on paper together |
-| `give_up` | — | Reveals the full answer warmly, then asks if the student wants to retry. **Yes** → resets counters, re-prints the verification scenario, `continue`s. **No** → `return`s |
+| `give_up` | — | Reveals the full answer warmly using `verification_ground_truth`, then asks if the student wants to retry. **Yes** → resets counters, re-prints the verification scenario, `continue`s. **No** → `return`s |
 
 **Recovery Loop detail (`give_up` path):**
 
-1. One Ollama call — directive opens with `OVERRIDE FIREWALL:` to bypass the base persona's answer prohibition. Pip reveals the answer (pulled from `evaluator_ground_truth` or `verification_ground_truth` depending on phase) and ends with the verbatim question *"Now that you know the secret, do you want to try explaining it to me so we can finish?"*
+1. One Ollama call — directive opens with `OVERRIDE FIREWALL:` to bypass the base persona's answer prohibition.
+   - **Phase 1:** Pip explains the answer using the `secret_fact` analogy in a full, helpful paragraph.
+   - **Phase 2:** Pip explains exactly why her scenario was wrong using `verification_ground_truth` in a full, helpful paragraph.
+   - Both phases end with the verbatim question *"Now that we know the secret, do you want to try explaining it to me so we can finish?"*
 2. A plain Python `input()` intercepts the reply — no AI needed for yes/no routing.
 3. **Yes** (`yes / y / sure / ok / okay / yeah / i guess`) — resets `frustration_counter` and `clarification_counter` to 0, re-seeds `pips_last_question` with the correct phase opening line, prints it, and `continue`s back to the top of the loop.
 4. **Anything else** — prints `[Session ended gracefully. You did a great job trying!]`, `return`s from `run_session`, and the outer menu loop shows the concept selector again.
+
+**Context Re-Injection:** When the Evaluator returns `question` or `off_topic`, Pip's `state_directive` always includes the exact verbatim text of the current phase's puzzle (`story_intro` for Phase 1, `verification_scenario` for Phase 2). This prevents the LLM from drifting to a hallucinated version of the puzzle after several turns.
 
 **UX indicator:** `[Pip is thinking...]` is printed before every streaming Ollama call so the student knows a response is coming rather than seeing a silent pause.
 
