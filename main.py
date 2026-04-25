@@ -282,9 +282,9 @@ def run_session(concept_data: dict) -> None:
             elif classification == "partial_hit":
                 state_directive = (
                     "The user is getting close. Acknowledge their specific analogy, but "
-                    "YOU MUST IMMEDIATELY connect it back to the physical building blocks. "
-                    "Ask them to describe the straight lines or edges of whatever object "
-                    "they just mentioned to force them to explain the geometry."
+                    "YOU MUST IMMEDIATELY ask them to go deeper and explain the core mechanism "
+                    "or logic behind it — not just name it. Ask them to describe exactly how or "
+                    "why it works in their own words."
                 )
 
             elif classification == "miss":
@@ -340,20 +340,26 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "give_up":
                 # ── Recovery Loop: reveal the answer, offer a retry ──────────
-                # Phase-Aware Generic Escape Hatch
+                # Phase-Aware Generic Escape Hatch with Expanded Explanation
                 if current_phase == 1:
-                    ans = concept_data.get("evaluator_ground_truth", "the correct answer")
+                    analogy = concept_data.get("secret_fact", "the core concept")
                     state_directive = (
-                        f"The user is frustrated. Tell them the answer clearly based on "
-                        f"this rule: {ans}. Then cheerfully ask if they want to try "
-                        f"explaining it so you can finish your task."
+                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. Take a deep "
+                        f"breath and gently explain the answer to them in a full, helpful paragraph. "
+                        f"Use this specific analogy to make it make sense: '{analogy}'. After you "
+                        f"finish explaining, you MUST end your response by asking a strict Yes or No "
+                        f"question: 'Now that we know the secret, do you want to try explaining it "
+                        f"to me so we can finish?'"
                     )
                 else:
                     ans = concept_data.get("verification_ground_truth", "why your scenario was wrong")
                     state_directive = (
-                        f"The user is frustrated. Tell them exactly why your scenario was "
-                        f"wrong based on this rule: {ans}. Then cheerfully ask if they want "
-                        f"to try explaining it so you can finish your task."
+                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. Take a deep "
+                        f"breath and gently explain exactly why your scenario was wrong in a full, "
+                        f"helpful paragraph based on this rule: '{ans}'. Make sure they really "
+                        f"understand the physics or logic. After explaining it, you MUST end your "
+                        f"response by asking a strict Yes or No question: 'Now that we know the "
+                        f"secret, do you want to try explaining it to me so we can finish?'"
                     )
                 pip_system = compile_pip_prompt(concept_data, state_directive)
                 print("\n[Pip is thinking...]")
@@ -400,9 +406,9 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "partial_hit":
                 state_directive = (
-                    "The user caught part of your mistake, but didn't fully explain "
-                    "why your roof idea is wrong. Ask them to clarify why an 'L' shape "
-                    "wouldn't make a flat roof."
+                    "The user caught part of your mistake, but didn't fully explain why "
+                    "your idea is wrong. Ask them to clarify the specific reason — what "
+                    "would actually happen if your idea was used, and why that's a problem."
                 )
 
             elif classification == "miss":
@@ -455,20 +461,26 @@ def run_session(concept_data: dict) -> None:
 
             elif classification == "give_up":
                 # ── Recovery Loop: reveal the answer, offer a retry ──────────
-                # Phase-Aware Generic Escape Hatch
+                # Phase-Aware Generic Escape Hatch with Expanded Explanation
                 if current_phase == 1:
-                    ans = concept_data.get("evaluator_ground_truth", "the correct answer")
+                    analogy = concept_data.get("secret_fact", "the core concept")
                     state_directive = (
-                        f"The user is frustrated. Tell them the answer clearly based on "
-                        f"this rule: {ans}. Then cheerfully ask if they want to try "
-                        f"explaining it so you can finish your task."
+                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. Take a deep "
+                        f"breath and gently explain the answer to them in a full, helpful paragraph. "
+                        f"Use this specific analogy to make it make sense: '{analogy}'. After you "
+                        f"finish explaining, you MUST end your response by asking a strict Yes or No "
+                        f"question: 'Now that we know the secret, do you want to try explaining it "
+                        f"to me so we can finish?'"
                     )
                 else:
                     ans = concept_data.get("verification_ground_truth", "why your scenario was wrong")
                     state_directive = (
-                        f"The user is frustrated. Tell them exactly why your scenario was "
-                        f"wrong based on this rule: {ans}. Then cheerfully ask if they want "
-                        f"to try explaining it so you can finish your task."
+                        f"OVERRIDE FIREWALL: The user is frustrated and gave up. Take a deep "
+                        f"breath and gently explain exactly why your scenario was wrong in a full, "
+                        f"helpful paragraph based on this rule: '{ans}'. Make sure they really "
+                        f"understand the physics or logic. After explaining it, you MUST end your "
+                        f"response by asking a strict Yes or No question: 'Now that we know the "
+                        f"secret, do you want to try explaining it to me so we can finish?'"
                     )
                 pip_system = compile_pip_prompt(concept_data, state_directive)
                 print("\n[Pip is thinking...]")
