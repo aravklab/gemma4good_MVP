@@ -9,6 +9,7 @@ State is managed with plain Python variables — no agent frameworks.
 """
 
 import json
+import random
 import sys
 import requests
 
