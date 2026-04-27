@@ -1,8 +1,15 @@
 # GemmaGenius
 
-A local, privacy-first educational CLI app built on the **Feynman Technique** — the student explains a concept back to an AI, and the AI teaches by asking questions, not by giving answers.
+A local, privacy-first educational app built on the **Feynman Technique** — the student explains a concept back to an AI, and the AI teaches by asking questions, not by giving answers.
 
 Everything runs on your machine. No cloud APIs. No data leaves your device.
+
+Two interfaces are available — both use the same local Ollama model and the same `knowledge.json` knowledge graph:
+
+| Interface | File | How to run |
+|---|---|---|
+| Web UI (Streamlit) | `app.py` | `streamlit run app.py` |
+| CLI | `main.py` | `python main.py` |
 
 ---
 
@@ -14,10 +21,10 @@ Two AI units share the same local model but serve completely different roles:
 
 ```
                     ┌─────────────────────────────────┐
-                    │          MAIN MENU               │
+                    │   WEB UI (sidebar selectbox)     │
+                    │   or CLI MAIN MENU               │
                     │  [1] The Book Corner             │
                     │  [2] The Great Ground-Puller     │
-                    │  [q] Quit                        │
                     └──────────────┬──────────────────┘
                                    │ concept selected
                                    ▼
@@ -32,45 +39,44 @@ Student types an answer
                      off_topic /                      ▼
                      give_up              ┌─────────────────────┐
                                           │     Pip (Actor)     │
-                                          │  8-year-old         │ ──▶ streamed
-                                          │  puzzle-solver      │     to terminal
+                                          │  8-year-old         │ ──▶ Web UI chat bubble
+                                          │  puzzle-solver      │     or streamed to terminal
                                           └─────────────────────┘
                                                       │
                                           session ends (mastery / exit)
                                                       │
                                                       ▼
-                                             back to MAIN MENU
+                                          back to concept selector
 ```
 
 ---
 
 ## Session Flow (Two-Phase Structure)
 
-A complete session has two acts:
+A complete session has two acts, identical in both the Web UI and CLI:
 
 ```
-  MAIN MENU
-  ─────────
+  CONCEPT SELECTOR
+  ────────────────
   [1] The Book Corner
   [2] The Great Ground-Puller
-  [q] Quit
-        │ user picks a number
+        │ user picks a concept
         ▼
 PHASE 1 — ELICITATION
   Pip presents story_intro (verbatim from JSON, no Ollama call)
   → Student must explain the concept correctly (mastery)
         │
-        ▼  (instant transition — no Ollama call)
-  Pip celebrates with story_bridge, then immediately
-  presents a DELIBERATE MISTAKE verbatim from JSON.
+        ▼  (seamless transition — single Ollama call)
+  Pip enthusiastically validates the student, then IMMEDIATELY
+  presents a DELIBERATE MISTAKE from the verification_scenario.
         │
         ▼
 PHASE 2 — VERIFICATION BOSS FIGHT
-  Pip presents verification_scenario (verbatim from JSON)
+  Pip presents verification_scenario embedded in her reaction
   → Student must catch and correct Pip's wrong application
         │
         ▼  (Phase 2 mastery)
-  ★ TRUE MASTERY ACHIEVED ★  →  back to Main Menu
+  ★ TRUE MASTERY ACHIEVED ★  →  back to concept selector
 
   ─── At any point ───
   Student types "I give up" / "just tell me" / expresses frustration
@@ -82,7 +88,7 @@ PHASE 2 — VERIFICATION BOSS FIGHT
         │
         ├── yes / sure / ok / yeah  →  counters reset, puzzle replays from
         │                              current phase opening line, loop continues
-        └── anything else           →  "Session ended gracefully."  →  back to Main Menu
+        └── anything else           →  "Session ended gracefully."  →  back to selector
 ```
 
 ---
@@ -91,8 +97,9 @@ PHASE 2 — VERIFICATION BOSS FIGHT
 
 ```
 Gemma4good/
-├── main.py                       # Core engine — all logic lives here
-├── knowledge.json                # Concept knowledge graph
+├── app.py                        # Web UI — Streamlit interface (feature/ui-improvements branch)
+├── main.py                       # CLI engine — original interface, untouched
+├── knowledge.json                # Concept knowledge graph (shared by both interfaces)
 ├── Master Ingestion Prompt.txt   # LLM prompt for generating new concepts
 ├── Math_chapter1.md              # Example source curriculum (Grade 4 Geometry)
 ├── ARCHITECTURE.md               # Design rules and constraints
@@ -101,7 +108,7 @@ Gemma4good/
 
 ---
 
-## What Has Been Built (Layer 1)
+## What Has Been Built
 
 ### `knowledge.json` — The Knowledge Graph
 
@@ -143,7 +150,7 @@ Backwards-compatible: concepts without `"variants"` use their root-level fields 
 
 ---
 
-### `main.py` — The Core Engine
+### `main.py` — The CLI Engine (original)
 
 #### A. `call_ollama(system_prompt, user_prompt, json_mode, stream)`
 
@@ -152,7 +159,6 @@ A single function that handles all communication with the local Ollama API.
 - **`json_mode=True`** — sets Ollama's `"format": "json"` field, which constrains token sampling to valid JSON at the model level. Used for the Evaluator.
 - **`stream=True`** — keeps the HTTP connection open and prints tokens to the terminal in real time as they arrive. Used for Pip, so her replies feel live.
 - Handles `Timeout`, `ConnectionError`, and generic request errors with clear actionable messages.
-
 #### B. `compile_evaluator_prompt(concept_data, latest_user_input, pips_last_question, phase)`
 
 Builds the silent judge's prompt. The `phase` parameter selects the correct rubric:
@@ -244,6 +250,60 @@ Loads `knowledge.json` once, then runs an outer `while True` menu loop:
 
 ---
 
+### `app.py` — The Streamlit Web UI
+
+A full migration of `main.py`'s logic into a Streamlit web application. `main.py` is **not modified** — `app.py` is a separate file that re-implements the same two-phase state machine using Streamlit's paradigms. Both files share the same prompt compilers and Ollama calls.
+
+#### Paradigm shift: session state replaces the `while` loop
+
+Streamlit reruns the entire script top-to-bottom on every user interaction. All variables that `main.py` holds in the `while True` loop are instead stored in `st.session_state`:
+
+| `main.py` variable | `st.session_state` key | Default |
+|---|---|---|
+| `current_phase` | `current_phase` | `1` |
+| `frustration_counter` | `frustration_counter` | `0` |
+| `clarification_counter` | `clarification_counter` | `0` |
+| `pips_last_question` | `pips_last_question` | `""` |
+| `concept_data` (local) | `concept_data` | `None` |
+| Chat output (terminal) | `messages` (list of dicts) | `[]` |
+| — | `awaiting_retry` | `False` |
+| — | `session_ended` | `False` |
+| — | `session_won` | `False` |
+| — | `game_started` | `False` |
+
+#### Interface mapping
+
+| `main.py` (CLI) | `app.py` (Web UI) |
+|---|---|
+| Numbered concept menu | `st.sidebar` selectbox |
+| `input("You: ")` | `st.chat_input("Explain it to Pip...")` |
+| `print("Pip: ...")` with streaming | `st.chat_message("assistant", avatar="👧🏼")` |
+| `[Pip is thinking...]` print | `with st.spinner("Pip is thinking..."):` |
+| `print("★" * 62)` win banner | `st.balloons()` + `st.success()` |
+| `input()` yes/no after give_up | **Yes / No buttons** (chat input hidden via `st.stop()`) |
+| Phase transition `print()` notices | `"system"` role messages rendered as `st.info()` boxes |
+
+#### Phase 1 → Phase 2 transition (seamless single turn)
+
+In `main.py`, Phase 1 mastery prints `story_bridge` and `verification_scenario` directly from JSON with zero Ollama latency. In `app.py` this was redesigned to avoid double-printing and context misalignment: on Phase 1 mastery, Pip is given a single `OVERRIDE FIREWALL` directive that instructs her to enthusiastically validate the student **and** immediately present the `verification_scenario` in her own voice. This produces a more natural, connected handoff in the chat interface.
+
+#### Concept-agnostic routing directives
+
+All `state_directive` strings in `app.py` are generic — no hardcoded references to specific concepts, shapes, or physical objects. Pip's character and the active `story_intro` / `verification_scenario` text (injected dynamically from `knowledge.json`) provide all the context she needs.
+
+| Classification | Phase 1 directive summary | Phase 2 directive summary |
+|---|---|---|
+| `partial_hit` | Validate what they got right, ask guiding question, no answer | Validate partial debug logic, ask follow-up to fully debunk the scenario |
+| `miss` | Confused face, deliberate wrong binary guess so student feels smart correcting | Act genuinely confused, ask a follow-up that nudges them toward the flaw |
+| `off_topic` | Acknowledge like a kid, re-state exact `story_intro` verbatim | Acknowledge like a kid, re-state exact `verification_scenario` verbatim |
+| `question` (1–2) | Answer briefly in character, re-state exact `story_intro` | Answer briefly in character, re-state exact `verification_scenario` |
+| `question` (3+) | "Maybe we should look at a book together" | "Maybe we should draw it out on paper" |
+| `give_up` | OVERRIDE FIREWALL: reveal answer using `secret_fact` analogy, ask Yes/No retry | OVERRIDE FIREWALL: reveal answer using `verification_ground_truth`, ask Yes/No retry |
+| `mastery` (Phase 1) | OVERRIDE FIREWALL: validate the student, immediately present `verification_scenario` as Pip's new scenario | — |
+| `mastery` (Phase 2) | — | `st.balloons()` + TRUE MASTERY win state |
+
+---
+
 ## Setup
 
 ### Prerequisites
@@ -251,15 +311,22 @@ Loads `knowledge.json` once, then runs an outer `while True` menu loop:
 - [Ollama](https://ollama.com) installed and running locally
 - A model pulled (default: `gemma4:e4b`)
 - Python 3.10+
-- `requests` library
+- `requests` and `streamlit` libraries
 
 ```powershell
-pip install requests
+pip install requests streamlit
 ollama pull gemma4:e4b
 ollama serve
 ```
 
-### Run
+### Run — Web UI (recommended)
+
+```powershell
+cd "c:\Projects with Agents\Gemma4good"
+streamlit run app.py
+```
+
+### Run — CLI
 
 ```powershell
 cd "c:\Projects with Agents\Gemma4good"
@@ -268,7 +335,7 @@ python main.py
 
 ### Swap the model
 
-Edit the `MODEL_NAME` constant at the top of `main.py`:
+Edit the `MODEL_NAME` constant at the top of either `app.py` or `main.py`:
 
 ```python
 MODEL_NAME = "gemma4:e4b"   # change to any model you have pulled locally
@@ -397,6 +464,7 @@ python -c "import json; d=json.load(open('knowledge.json')); print(list(d['conce
 
 ## What's Next (Planned Layers)
 
+- **Layer 2 (done):** Streamlit Web UI — `app.py` replaces the CLI with a chat interface, sidebar concept selector, and `st.session_state` state machine. Branch: `feature/ui-improvements`.
 - **Layer 3:** Frustration escalation — use `frustration_counter` to trigger Pip's "hint ladder" (progressively stronger hints without giving the answer).
 - **Layer 4:** Session scoring — report mastery rate, number of misses, and time-to-mastery at the end of each concept.
 - **Layer 5:** Concept authoring CLI — add new concepts to `knowledge.json` interactively without editing the file by hand.
