@@ -1,0 +1,15 @@
+{
+  "student_name": "Explorer",
+  "achievements": {
+    "The Book Corner": {
+      "status": "Mastered",
+      "frustration_triggers": 0,
+      "boss_fight_attempts": 1
+    },
+    "Trees Talk Secretly Under Soil": {
+      "status": "Mastered",
+      "frustration_triggers": 0,
+      "boss_fight_attempts": 1
+    }
+  }
+}
