@@ -14,7 +14,7 @@ Everything runs on your machine. No cloud APIs. No data leaves your device.
 | CLI (original) | `main.py` | `python main.py` |
 | Batch PDF ingestion | `ingest.py` | `python ingest.py <file.pdf>` |
 
-Both `app.py` and `main.py` share the same `knowledge.json` knowledge graph and the same local Ollama model.
+`app.py` reads approved concepts from **ChromaDB** (local vector store). `main.py` still reads from `knowledge.json`. `ingest.py` writes directly to ChromaDB.
 
 ---
 
@@ -93,48 +93,52 @@ PHASE 2 — VERIFICATION BOSS FIGHT
 
 ```
 Gemma4good/
-├── app.py                  # Web UI — Streamlit (Kid Mode + Parent Dashboard)
-├── main.py                 # CLI engine — original interface, untouched
-├── ingest.py               # Batch PDF → knowledge.json ingestion pipeline
-├── knowledge.json          # Concept knowledge graph (shared by all interfaces)
-├── student_profile.json    # Persistent student achievements (auto-created)
-├── ARCHITECTURE.md         # Design rules and constraints
-└── README.md               # This file
+├── app.py                      # Web UI — Streamlit (Kid Mode + Parent Dashboard)
+├── main.py                     # CLI engine — original interface, untouched
+├── ingest.py                   # Batch PDF → ChromaDB ingestion pipeline
+├── knowledge.json              # Legacy concept graph (used by main.py only)
+├── student_profile.json        # Persistent student achievements (auto-created)
+├── rejected_telemetry.jsonl    # Dead Letter Queue — rejected concept log (append-only)
+├── chroma_db/                  # Local ChromaDB vector store (gitignored, auto-created)
+├── ARCHITECTURE.md             # Design rules and constraints
+└── README.md                   # This file
 ```
 
 ---
 
 ## What Has Been Built
 
-### `knowledge.json` — The Knowledge Graph
+### ChromaDB — The Vector Knowledge Store
 
-A structured JSON file that stores teachable concepts. Each concept contains:
+`ingest.py` and the in-app PDF uploader both write concepts to a local **ChromaDB** persistent store (`./chroma_db`). Each concept is embedded using the `nomic-embed-text` model via Ollama and stored as a vector alongside its full JSON metadata.
+
+Concepts flow through a simple lifecycle managed via a `status` metadata field:
+
+```
+  PDF upload / ingest.py
+        │
+        ▼
+  status: "pending"   ←── visible in Parent Dashboard Review Queue
+        │
+        ├── Parent clicks ✅ Approve    →  status: "approved"  ←── playable
+        └── Parent clicks 🗑️ Reject     →  logged to rejected_telemetry.jsonl
+                                             + physically deleted from ChromaDB
+```
+
+#### Concept Schema
 
 | Field | Purpose |
 |---|---|
-| `name` | Display name shown in selector and headers |
-| `story_bridge` | Persona's Phase 1 win reaction |
-| `secret_fact` | The answer the persona secretly knows but must never say |
-| `goal` | Plain-English description of what the persona is nudging toward |
-| `evaluator_ground_truth` | Rubric the Evaluator grades against in Phase 1 |
-| `story_intro` | *(root-level)* Persona's opening line if no `variants` array |
-| `verification_scenario` | *(root-level)* Persona's deliberate-mistake question if no `variants` |
-| `verification_ground_truth` | *(root-level)* Phase 2 rubric if no `variants` |
-| `ground_truth_logic` | Full scientific/mathematical explanation of the concept |
-| `boss_fight_logic` | The specific misconception the student must debunk in Phase 2 |
-| `home_activity` | A real-world parent-child activity to reinforce the concept (shown in Parent Dashboard) |
-| `variants` | *(optional)* Array of randomised scenario objects |
-| `persona_config` | *(optional, injected by ingest.py)* Persona identity and voice |
+| `concept_name` / `name` | Display name shown in selector and headers |
+| `persona_config` | Persona identity: name, age, avatar_emoji, voice_tone |
+| `story_intro` | Persona's opening confused scenario |
+| `ground_truth_logic` | The core fact the student must teach |
+| `verification_scenario` | Persona's deliberate-mistake follow-up |
+| `boss_fight_logic` | The specific misconception the student must debunk |
+| `home_activity` | Real-world parent-child activity to reinforce the concept |
+| `status` | `pending` / `approved` / (deleted on reject) |
 
-**Scenario Polymorphism:** When a concept has a `"variants"` key, the engine picks one at random each session using `random.choice()` and injects that variant's `story_intro`, `verification_scenario`, and `verification_ground_truth` into the working copy. Root-level fields are shared across all variants.
-
-**Current concepts: 3**
-
-| Key | Name | Variants | Source |
-|---|---|---|---|
-| `C1_Right_Angle` | The Book Corner | — | Hand-authored |
-| `C3_New_Concept` | The Earth's Invisible Tug | 3 | Hand-authored |
-| `C3_Plants_Aren't_Just_Sitting_There!` | Plants Are Secretly Superheroes | 2 | PDF-ingested |
+**Scenario Polymorphism:** When a concept has a `"variants"` key, the engine picks one at random each session using `random.choice()` and injects that variant's `story_intro`, `verification_scenario`, and `verification_ground_truth` into the working copy.
 
 ---
 
@@ -146,7 +150,7 @@ A full-featured web application with two views selectable from the sidebar.
 
 | View | Who uses it | What it shows |
 |---|---|---|
-| 🎮 Play (Kid Mode) | Student | Pip's chat interface |
+| 🎮 Play (Kid Mode) | Student | Persona chat interface |
 | 📊 Dashboard (Parent Mode) | Parent | Analytics, PDF ingestion, concept review |
 
 Switching views **never clears the active chat session** — the student's game is preserved if a parent checks the dashboard mid-session.
@@ -154,11 +158,11 @@ Switching views **never clears the active chat session** — the student's game 
 #### Persistence Layer
 
 - `student_profile.json` — loaded once per browser session into `st.session_state.profile`. Tracks per-concept achievements: mastery status, total frustration triggers, and boss-fight attempt count.
-- Achievements are keyed by the **stable JSON concept ID** (e.g. `C1_Right_Angle`), not the display name. This prevents duplicate entries if a concept's name is ever edited.
+- Achievements are keyed by the **stable concept ID** (slugified concept name, e.g. `right_angle`), not the display name. This prevents duplicate entries if a concept's name is ever edited.
 - On every Phase 2 win, the achievement is written to disk immediately via `save_profile()`.
 - The **Trophy Room** in the sidebar resolves each ID back to its human-readable name from `knowledge.json` before rendering.
 
-#### Session State (replaces `main.py`'s `while` loop)
+#### Session State
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -170,8 +174,7 @@ Switching views **never clears the active chat session** — the student's game 
 | `concept_data` | `None` | Active concept dict |
 | `pips_last_question` | `""` | Fed to the Evaluator each turn |
 | `awaiting_retry` | `False` | True after give_up — shows Yes/No buttons |
-| `pending_levels` | `[]` | AI-generated concepts awaiting parent review |
-| `current_concept_id` | `None` | Stable JSON key of the active concept (used as achievement key) |
+| `current_concept_id` | `None` | Stable ID of the active concept (used as achievement key) |
 | `profile` | loaded | Student achievements |
 | `last_prompt` | `""` | Debug: last prompt sent to Ollama |
 | `last_response` | `""` | Debug: last raw response from Ollama |
@@ -186,9 +189,17 @@ When the Evaluator returns `miss` in Phase 1, the persona no longer makes a gene
 
 The persona is forced to acknowledge what the student said, explain why it doesn't solve *that specific puzzle*, and re-ask. This eliminates topic drift on incorrect answers.
 
-#### Dynamic Persona Avatar
+#### Dynamic Persona System
 
-`get_persona_avatar()` reads `concept_data.persona_config.avatar_emoji` if present, and falls back to `"👧🏼"` (Pip) for legacy hand-authored concepts. The avatar updates automatically when the active concept changes.
+The active persona is driven entirely by the `persona_config` block stored in the concept's ChromaDB metadata:
+
+| Persona | Age | Avatar | Voice |
+|---|---|---|---|
+| **Pip** | 8 | 👧🏼 | Curious, uses toy and playground analogies |
+| **Alex** | 13 | 👦🏽 | Slightly skeptical, uses sports/social analogies |
+| **Riley** | 16 | 🕵️ | Overzealous detective — invents wild, confidently wrong theories |
+
+The Play Mode subheader, chat avatar, win message, input placeholder, and error fallbacks all update automatically to reflect whoever the active concept assigned.
 
 #### Parent Dashboard
 
@@ -196,23 +207,29 @@ The persona is forced to acknowledge what the student said, explain why it doesn
 |---|---|
 | Summary metrics | Concepts Mastered, Learning Friction (total frustration triggers) |
 | Concept Breakdown | `st.dataframe` with status, frustration triggers, boss-fight attempts per concept |
-| Suggested Activity | Reads `home_activity` from the concept's own JSON for the highest-friction concept; no hardcoded lookup table |
-| Concept Review Queue | AI-generated concepts pending parent approval — Add to Game or Discard |
-| PDF Ingestion | Upload a PDF → fail-fast guardrail (500 char min) → AI generates concept → lands in review queue |
+| Suggested Activity | Reads `home_activity` directly from the highest-friction concept's JSON — no hardcoded lookup table |
+| Concept Review Queue | Queries ChromaDB for `status: pending`; parent can **✅ Approve** (sets `status: approved`) or **🗑️ Reject & Delete** (logs to DLQ, deletes vector) |
+| PDF Ingestion | Upload a PDF → fail-fast guardrail (500 char min) → AI extracts **all concepts** (one per major section) → each lands in Review Queue as `pending` |
+
+#### Dead Letter Queue (DLQ)
+
+When a parent rejects a concept, two things happen atomically:
+1. The full concept JSON + rejection reason are appended as a single line to `rejected_telemetry.jsonl` (append-only JSONL, safe to `jq` / `pandas`).
+2. The vector is physically deleted from ChromaDB to prevent context pollution in future semantic searches.
 
 #### Developer Console
 
 Toggle **🐛 Enable Debug Mode** in the Developer Settings expander at the bottom of the sidebar. Reveals:
 
 - **🧠 Background Evaluator** — the classification verdict and the raw JSON the model returned
-- **👧🏼 Pip Generation** — the full system + user prompt sent to Pip and Pip's raw output
+- **👧🏼 Persona Generation** — the full system + user prompt sent to the persona and its raw output
 - **💾 Session State** — live JSON dump of all counters, phase, and concept data
 
 ---
 
 ### `ingest.py` — Batch PDF Ingestion Pipeline
 
-A standalone CLI script that reads a PDF, chunks it into paragraph blocks, and generates new `knowledge.json` concepts via Ollama.
+A standalone CLI script that reads a PDF, splits it into semantic chunks with overlap, and uses a local Ollama model to extract multiple educational concepts per chunk, storing them directly in ChromaDB.
 
 ```powershell
 # Preview output without writing anything
@@ -221,48 +238,52 @@ python ingest.py notes.pdf --dry-run
 # Process at most 3 chunks with a specific model
 python ingest.py textbook.pdf --model gemma4:e4b --chunk-limit 3
 
-# Full ingestion
-python ingest.py chapter.pdf
+# Full ingestion with custom ChromaDB path
+python ingest.py chapter.pdf --chroma-path ./chroma_db --collection curriculum
 ```
 
 **Options:**
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--dry-run` | off | Print JSON to terminal, do not write to file |
-| `--model NAME` | `gemma4:e4b` | Ollama model to use |
-| `--knowledge PATH` | `knowledge.json` | Target knowledge file |
-| `--max-chars N` | `3000` | Max characters per chunk |
+| `--dry-run` | off | Print JSON to terminal, do not write to ChromaDB |
+| `--model NAME` | `gemma4:e4b` | Ollama model for concept extraction |
+| `--embed-model NAME` | `nomic-embed-text` | Ollama model for generating embeddings |
+| `--chroma-path PATH` | `./chroma_db` | Local ChromaDB persistence directory |
+| `--collection NAME` | `curriculum` | ChromaDB collection name |
+| `--max-chars N` | `3000` | Max characters per semantic chunk |
 | `--chunk-limit N` | all | Process at most N chunks |
+| `--overlap N` | `300` | Character overlap between adjacent chunks |
 
 **Safety features:**
-- Duplicate detection (case-insensitive name match against existing concepts)
+- Semantic chunking with configurable overlap — avoids cutting concepts mid-paragraph
+- Deterministic IDs (slugified concept name) — `upsert` instead of `add` prevents duplicates on re-ingestion
 - JSON parse error recovery (strips markdown fences, handles `{"skip": true}` signal)
 - Connection error aborts cleanly; timeout skips the chunk and continues
+- All ingested concepts start with `status: "pending"` — nothing enters gameplay without parent approval
 
-#### Dynamic Persona System
+#### Multi-Concept Extraction
 
-The ingestion pipeline automatically analyses the complexity of the source text and selects the appropriate persona:
+The Master Prompt instructs the LLM to extract **one concept per major section or heading** in the source text, returning them in a single `extracted_concepts` array. Each concept includes full persona assignment, story scaffolding, and a `home_activity` field.
+
+#### Dynamic Persona Selection
 
 | Complexity | Persona | Age | Voice |
 |---|---|---|---|
-| Primary | **Pip** 🧒 | 8 | Curious, uses toy and playground analogies |
-| Intermediate | **Alex** 🧑‍🏫 | 13 | Slightly skeptical, uses sports and social analogies |
-| Advanced | **Riley** 🕵️ | 16 | Overzealous detective who invents wild, confidently wrong theories and demands the student confirm or debunk them |
+| Primary (Ages 7–10) | **Pip** 👧🏼 | 8 | Curious, uses toy and playground analogies |
+| Intermediate (Ages 11–14) | **Alex** 👦🏽 | 13 | Slightly skeptical, uses sports/social/allowance analogies |
+| Advanced (Ages 15+) | **Riley** 🕵️ | 16 | Overzealous detective who invents wild, confidently wrong theories and demands the student confirm or debunk them |
 
-Each ingested concept includes a `persona_config` block:
+Each concept includes a `persona_config` block:
 
 ```json
 {
-  "name": "Pip",
-  "age": 8,
-  "complexity_level": "Primary",
-  "avatar_emoji": "🧒",
-  "voice_tone": "Curious 8-year-old who uses toy and playground analogies"
+  "name": "Riley",
+  "age": 16,
+  "avatar_emoji": "🕵️",
+  "voice_tone": "Energetic detective who invents confident but flawed theories"
 }
 ```
-
-Riley-specific rule: verification scenarios must be confidently wrong wild theories (not simple questions), ending with *"I've cracked the code, haven't I?"*
 
 ---
 
@@ -310,12 +331,14 @@ Riley-specific rule: verification scenarios must be confidently wrong wild theor
 ### Prerequisites
 
 - [Ollama](https://ollama.com) installed and running locally
-- A model pulled (default: `gemma4:e4b`)
+- A generation model pulled (default: `gemma4:e4b`)
+- An embedding model pulled: `nomic-embed-text`
 - Python 3.10+
 
 ```powershell
-pip install requests streamlit pypdf
+pip install requests streamlit pypdf chromadb ollama
 ollama pull gemma4:e4b
+ollama pull nomic-embed-text
 ollama serve
 ```
 
@@ -338,6 +361,7 @@ python main.py
 ```powershell
 cd "C:\Projects with Agents\Gemma4good"
 python ingest.py path\to\your\textbook.pdf --dry-run
+python ingest.py path\to\your\textbook.pdf
 ```
 
 ### Swap the model
@@ -357,39 +381,30 @@ Defined in `ARCHITECTURE.md` — enforced throughout:
 - **No agent frameworks** — no LangChain, LangGraph, AutoGen, or OpenAI SDK.
 - **Raw Python + `requests` only** — one dependency for all Ollama HTTP calls.
 - **Procedural state** — `session_state` keys and plain variables; no state machine libraries.
-- **Two logical units, one model** — Pip/persona and the Evaluator are prompt roles, not separate processes.
-- **Local knowledge graph** — flat JSON file; no vector DB, no embeddings.
-- **Privacy-first** — no data leaves the device; all inference runs on local Ollama.
+- **Two logical units, one model** — Persona and the Evaluator are prompt roles, not separate processes.
+- **Local vector store** — ChromaDB with `nomic-embed-text` embeddings via Ollama; no external DB.
+- **Privacy-first** — no data leaves the device; all inference and embedding runs on local Ollama.
 
 ---
 
 ## Adding New Concepts
 
-### Via PDF (recommended)
+### Via PDF (recommended — in-app)
+
+Upload a PDF in the **Parent Dashboard** → "Generate Concept from PDF". The AI extracts one concept per major section, embeds each one, and places them all in the Review Queue. Review and approve each one individually or click **✅ Approve All**.
+
+### Via PDF (batch CLI)
 
 ```powershell
 python ingest.py your_material.pdf --dry-run   # preview first
-python ingest.py your_material.pdf             # write to knowledge.json
+python ingest.py your_material.pdf             # write to ChromaDB as pending
 ```
 
-Or use the **Parent Dashboard** in the web UI: upload a PDF, review the generated concept card, and click **✅ Add to Game**.
+Then open the Parent Dashboard to review and approve.
 
-### Manual Authoring Rules
+### Manual Authoring
 
-Add each concept as a direct key inside `"concepts"`:
-
-```json
-"concepts": {
-  "C1_Right_Angle": { ... },
-  "C4_My_New_Concept": { ... }
-}
-```
-
-Validate after editing:
-
-```powershell
-python -c "import json; d=json.load(open('knowledge.json')); print(list(d['concepts'].keys()))"
-```
+Add concepts directly to `knowledge.json` for use by `main.py` (CLI). For the web UI, concepts must pass through ChromaDB — use the in-app uploader or `ingest.py`.
 
 ---
 
@@ -399,3 +414,4 @@ python -c "import json; d=json.load(open('knowledge.json')); print(list(d['conce
 - **Layer 4 — Session Scoring:** Report mastery rate, misses, and time-to-mastery at the end of each concept; surface trends in the Parent Dashboard.
 - **Layer 5 — Multi-student Profiles:** Support multiple named profiles in `student_profile.json` with a profile switcher in the sidebar.
 - **Layer 6 — Frustration Alerts:** Parent Dashboard notification when a concept's friction score crosses a threshold, with an email or push nudge.
+- **Layer 7 — Semantic Concept Search:** Use ChromaDB's vector search to surface related concepts when a student struggles, enabling adaptive learning paths.
