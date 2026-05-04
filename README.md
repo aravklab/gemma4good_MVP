@@ -120,6 +120,9 @@ A structured JSON file that stores teachable concepts. Each concept contains:
 | `story_intro` | *(root-level)* Persona's opening line if no `variants` array |
 | `verification_scenario` | *(root-level)* Persona's deliberate-mistake question if no `variants` |
 | `verification_ground_truth` | *(root-level)* Phase 2 rubric if no `variants` |
+| `ground_truth_logic` | Full scientific/mathematical explanation of the concept |
+| `boss_fight_logic` | The specific misconception the student must debunk in Phase 2 |
+| `home_activity` | A real-world parent-child activity to reinforce the concept (shown in Parent Dashboard) |
 | `variants` | *(optional)* Array of randomised scenario objects |
 | `persona_config` | *(optional, injected by ingest.py)* Persona identity and voice |
 
@@ -151,8 +154,9 @@ Switching views **never clears the active chat session** — the student's game 
 #### Persistence Layer
 
 - `student_profile.json` — loaded once per browser session into `st.session_state.profile`. Tracks per-concept achievements: mastery status, total frustration triggers, and boss-fight attempt count.
+- Achievements are keyed by the **stable JSON concept ID** (e.g. `C1_Right_Angle`), not the display name. This prevents duplicate entries if a concept's name is ever edited.
 - On every Phase 2 win, the achievement is written to disk immediately via `save_profile()`.
-- The **Trophy Room** in the sidebar shows a gold star for every mastered concept.
+- The **Trophy Room** in the sidebar resolves each ID back to its human-readable name from `knowledge.json` before rendering.
 
 #### Session State (replaces `main.py`'s `while` loop)
 
@@ -167,6 +171,7 @@ Switching views **never clears the active chat session** — the student's game 
 | `pips_last_question` | `""` | Fed to the Evaluator each turn |
 | `awaiting_retry` | `False` | True after give_up — shows Yes/No buttons |
 | `pending_levels` | `[]` | AI-generated concepts awaiting parent review |
+| `current_concept_id` | `None` | Stable JSON key of the active concept (used as achievement key) |
 | `profile` | loaded | Student achievements |
 | `last_prompt` | `""` | Debug: last prompt sent to Ollama |
 | `last_response` | `""` | Debug: last raw response from Ollama |
@@ -191,7 +196,7 @@ The persona is forced to acknowledge what the student said, explain why it doesn
 |---|---|
 | Summary metrics | Concepts Mastered, Learning Friction (total frustration triggers) |
 | Concept Breakdown | `st.dataframe` with status, frustration triggers, boss-fight attempts per concept |
-| Suggested Activity | Home activity for the concept with the highest friction |
+| Suggested Activity | Reads `home_activity` from the concept's own JSON for the highest-friction concept; no hardcoded lookup table |
 | Concept Review Queue | AI-generated concepts pending parent approval — Add to Game or Discard |
 | PDF Ingestion | Upload a PDF → fail-fast guardrail (500 char min) → AI generates concept → lands in review queue |
 
@@ -392,6 +397,5 @@ python -c "import json; d=json.load(open('knowledge.json')); print(list(d['conce
 
 - **Layer 3 — Hint Ladder:** Use `frustration_counter` to trigger progressively stronger hints without giving the answer away.
 - **Layer 4 — Session Scoring:** Report mastery rate, misses, and time-to-mastery at the end of each concept; surface trends in the Parent Dashboard.
-- **Layer 5 — Persona Voice in Pip Prompt:** Propagate `persona_config.voice_tone` into `compile_pip_prompt` so Alex and Riley's voices are enforced at the system-prompt level, not just at ingestion time.
-- **Layer 6 — Multi-student Profiles:** Support multiple named profiles in `student_profile.json` with a profile switcher in the sidebar.
-- **Layer 7 — Frustration Alerts:** Parent Dashboard notification when a concept's friction score crosses a threshold, with an email or push nudge.
+- **Layer 5 — Multi-student Profiles:** Support multiple named profiles in `student_profile.json` with a profile switcher in the sidebar.
+- **Layer 6 — Frustration Alerts:** Parent Dashboard notification when a concept's friction score crosses a threshold, with an email or push nudge.

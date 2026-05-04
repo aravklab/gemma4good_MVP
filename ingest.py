@@ -9,7 +9,7 @@ Usage:
 
 Options:
     --dry-run         Print generated JSON to terminal; do NOT write to file.
-    --model NAME      Ollama model to use (default: gemma3:4b).
+    --model NAME      Ollama model to use (default: gemma4:e4b).
     --knowledge PATH  Path to knowledge.json (default: knowledge.json).
     --max-chars N     Max characters per chunk (default: 3000).
     --chunk-limit N   Process at most N chunks (default: all).
@@ -144,7 +144,9 @@ def chunk_text(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[str]:
 
 SYSTEM_PROMPT = """\
 You are an expert curriculum designer for GemmaGenius, a Feynman Technique learning app.
-Transform the provided textbook text into a structured JSON module.
+
+TASK: Read the provided text and identify the CORE distinct educational concepts.
+Extract between 1 and 3 concepts maximum (ignore minor trivia or repeated ideas).
 
 STEP 1 — COMPLEXITY DETECTION:
 Before writing any content, analyse the source text and classify it as exactly one of:
@@ -153,7 +155,7 @@ Before writing any content, analyse the source text and classify it as exactly o
   - "Advanced"     : technical mechanisms, high-school/university vocabulary, abstract logic
 
 STEP 2 — PERSONA SELECTION:
-Based on the complexity level, set the persona_config as follows:
+Based on the complexity level, select ONE persona that applies to ALL concepts in this chunk:
 
   Primary   -> { "name": "Pip",  "age": 8,  "complexity_level": "Primary",
                  "avatar_emoji": "🧒",
@@ -167,44 +169,51 @@ Based on the complexity level, set the persona_config as follows:
                  "avatar_emoji": "🕵️",
                  "voice_tone": "Overzealous detective who invents wild, confidently incorrect theories and demands the user confirm or debunk them" }
 
-STEP 3 — WRITE ALL STORY FIELDS in the selected persona's voice.
-The persona must be consistent across story_intro, story_bridge, variants, and verification_scenario.
+STEP 3 — WRITE ALL STORY FIELDS for EACH concept in the selected persona's voice.
+The persona must be consistent across story_intro, story_bridge, variants, and verification_scenario
+for every concept in the array.
 
-SCHEMA:
+TARGET SCHEMA:
 {
-  "persona_config": {
-    "name": "<Pip | Alex | Riley>",
-    "age": <8 | 13 | 16>,
-    "complexity_level": "<Primary | Intermediate | Advanced>",
-    "avatar_emoji": "<emoji>",
-    "voice_tone": "<tone description>"
-  },
-  "concept_name": "Catchy Title",
-  "name": "Catchy Title",
-  "story_intro": "<persona> is in a real-world scenario confused by this topic.",
-  "story_bridge": "<persona>'s brief celebration when the student explains it correctly.",
-  "secret_fact": "The actual scientific or mathematical explanation in one sentence.",
-  "goal": "What the student must understand to win.",
-  "evaluator_ground_truth": "Phase 1 ground truth: what the student must explain.",
-  "variants": [
+  "extracted_concepts": [
     {
-      "story_intro": "Alternate scenario A in <persona>'s voice (same concept, different context).",
-      "verification_scenario": "<persona> applies the logic but makes a specific logical error. Ends with 'right?'",
-      "verification_ground_truth": "Why the variant scenario is wrong."
-    },
-    {
-      "story_intro": "Alternate scenario B in <persona>'s voice.",
-      "verification_scenario": "Another logical trap <persona> falls into.",
-      "verification_ground_truth": "Why this variant scenario is wrong."
+      "persona_config": {
+        "name": "<Pip | Alex | Riley>",
+        "age": <8 | 13 | 16>,
+        "complexity_level": "<Primary | Intermediate | Advanced>",
+        "avatar_emoji": "<emoji>",
+        "voice_tone": "<tone description>"
+      },
+      "concept_name": "Catchy Title",
+      "name": "Catchy Title",
+      "story_intro": "<persona> is in a real-world scenario confused by this topic.",
+      "story_bridge": "<persona>'s brief celebration when the student explains it correctly.",
+      "secret_fact": "The actual scientific or mathematical explanation in one sentence.",
+      "goal": "What the student must understand to win.",
+      "evaluator_ground_truth": "Phase 1 ground truth: what the student must explain.",
+      "variants": [
+        {
+          "story_intro": "Alternate scenario A in <persona>'s voice (same concept, different context).",
+          "verification_scenario": "<persona> applies the logic but makes a specific logical error. Ends with 'right?'",
+          "verification_ground_truth": "Why the variant scenario is wrong."
+        },
+        {
+          "story_intro": "Alternate scenario B in <persona>'s voice.",
+          "verification_scenario": "Another logical trap <persona> falls into.",
+          "verification_ground_truth": "Why this variant scenario is wrong."
+        }
+      ],
+      "verification_scenario": "<persona> applies the concept but makes a specific error. Ends with 'right?'",
+      "verification_ground_truth": "The specific error the student must catch and correct.",
+      "ground_truth_logic": "The actual scientific or mathematical explanation.",
+      "boss_fight_logic": "The specific misconception the student must debunk in Phase 2.",
+      "home_activity": "A simple real-world physical activity a parent and child can do together to explore this concept."
     }
-  ],
-  "verification_scenario": "<persona> applies the concept but makes a specific error. Ends with 'right?'",
-  "verification_ground_truth": "The specific error the student must catch and correct.",
-  "ground_truth_logic": "The actual scientific or mathematical explanation.",
-  "boss_fight_logic": "The specific misconception the student must debunk in Phase 2."
+  ]
 }
 
 RULES:
+- Return an array of 1 to 3 concept objects inside "extracted_concepts". Never return more than 3.
 - ALL story text must match the chosen persona's age and voice_tone. Do not mix personas.
 - The verification_scenario must be a logical trap containing one clear correctable error.
 - RILEY-SPECIFIC RULE: When the persona is Riley, story_intro and verification_scenario must NOT be
@@ -212,8 +221,10 @@ RULES:
   derived from the text — like a detective who has "cracked the case" but got it completely wrong.
   Riley is energetic and sassy. End every Riley verification_scenario with "I've cracked the code,
   haven't I?" instead of the standard "right?".
-- Output raw JSON only. No markdown fences, no commentary before or after the JSON.
-- If the source text does not contain enough content for a meaningful concept, output: {"skip": true}
+- CRITICAL: Return ONLY the raw JSON object containing the 'extracted_concepts' array.
+  Do NOT wrap it in markdown formatting or add any conversational text before or after.
+- If the source text does not contain enough content for even one meaningful concept,
+  output: {"skip": true}
 """
 
 
@@ -249,33 +260,17 @@ def call_ollama(chunk: str, model: str) -> str:
 # 4. JSON PARSING  (with safety net)
 # ---------------------------------------------------------------------------
 
-def parse_concept(raw: str, chunk_index: int) -> dict | None:
+def _validate_concept(data: dict, chunk_index: int, item_index: int) -> dict | None:
     """
-    Parse the LLM's raw output into a dict.
-    Returns None on any parse failure or if the model signals {"skip": true}.
+    Validate a single concept dict extracted from the LLM array.
+    Returns the normalised dict, or None if required fields are missing.
     """
-    if not raw:
-        print(f"[WARN] Chunk {chunk_index}: empty response from model. Skipping.")
-        return None
-
-    # Strip accidental markdown fences the model might still add
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        print(f"[WARN] Chunk {chunk_index}: JSON parse error — {exc}. Skipping.")
-        return None
-
-    if data.get("skip"):
-        print(f"[INFO] Chunk {chunk_index}: model signalled insufficient content. Skipping.")
-        return None
-
-    # Require at minimum a name and a story_intro
     name = data.get("concept_name") or data.get("name")
     if not name or not data.get("story_intro"):
-        print(f"[WARN] Chunk {chunk_index}: missing required fields (name/story_intro). Skipping.")
+        print(
+            f"[WARN] Chunk {chunk_index}, item {item_index}: "
+            "missing required fields (name/story_intro). Skipping item."
+        )
         return None
 
     # Normalise: ensure both 'name' and 'concept_name' are set
@@ -286,14 +281,66 @@ def parse_concept(raw: str, chunk_index: int) -> dict | None:
     persona = data.get("persona_config", {})
     if persona:
         print(
-            f"[PERSONA] Detected complexity: {persona.get('complexity_level', '?')} "
+            f"[PERSONA] Item {item_index}: complexity={persona.get('complexity_level', '?')} "
             f"-> {persona.get('name', '?')} (age {persona.get('age', '?')}) "
             f"{persona.get('avatar_emoji', '')}"
         )
     else:
-        print(f"[WARN] Chunk {chunk_index}: model did not return a persona_config block.")
+        print(f"[WARN] Chunk {chunk_index}, item {item_index}: model did not return a persona_config block.")
 
     return data
+
+
+def parse_concepts(raw: str, chunk_index: int) -> list[dict]:
+    """
+    Parse the LLM's raw output into a list of concept dicts.
+
+    Handles the new multi-concept envelope {"extracted_concepts": [...]} as well
+    as the legacy single-object response for robustness.
+    Returns an empty list on any unrecoverable parse failure.
+    """
+    if not raw:
+        print(f"[WARN] Chunk {chunk_index}: empty response from model. Skipping.")
+        return []
+
+    # Strip accidental markdown fences the model might still add
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        print(f"[WARN] Chunk {chunk_index}: JSON parse error — {exc}. Skipping.")
+        return []
+
+    # Model signalled there is nothing worth extracting
+    if data.get("skip"):
+        print(f"[INFO] Chunk {chunk_index}: model signalled insufficient content. Skipping.")
+        return []
+
+    # ── New envelope format ──────────────────────────────────────────────────
+    if "extracted_concepts" in data:
+        raw_list = data["extracted_concepts"]
+        if not isinstance(raw_list, list):
+            print(f"[WARN] Chunk {chunk_index}: 'extracted_concepts' is not a list. Skipping.")
+            return []
+
+        concepts: list[dict] = []
+        for idx, item in enumerate(raw_list, start=1):
+            if not isinstance(item, dict):
+                print(f"[WARN] Chunk {chunk_index}, item {idx}: not a dict. Skipping item.")
+                continue
+            validated = _validate_concept(item, chunk_index, idx)
+            if validated:
+                concepts.append(validated)
+
+        print(f"[INFO] Chunk {chunk_index}: extracted {len(concepts)} valid concept(s) from array of {len(raw_list)}.")
+        return concepts
+
+    # ── Legacy fallback: model returned a bare single-concept object ─────────
+    print(f"[INFO] Chunk {chunk_index}: response is a bare object — treating as single concept (legacy).")
+    validated = _validate_concept(data, chunk_index, item_index=1)
+    return [validated] if validated else []
 
 
 # ---------------------------------------------------------------------------
@@ -380,35 +427,36 @@ def run(
     for i, chunk in enumerate(chunks, start=1):
         print(f"\n[{i}/{len(chunks)}] Sending chunk to {model}…")
 
-        raw     = call_ollama(chunk, model)
-        concept = parse_concept(raw, chunk_index=i)
+        raw      = call_ollama(chunk, model)
+        concepts = parse_concepts(raw, chunk_index=i)
 
-        if concept is None:
+        if not concepts:
             skipped += 1
             continue
 
-        concept_name = concept["name"]
+        for concept in concepts:
+            concept_name = concept["name"]
 
-        # Step 3a — Duplicate guard
-        if is_duplicate(concept_name, knowledge):
-            print(f"[SKIP] '{concept_name}' already exists in {kg_path}. Skipping.")
-            skipped += 1
-            continue
+            # Duplicate guard (re-checked after every addition so keys stay fresh)
+            if is_duplicate(concept_name, knowledge):
+                print(f"[SKIP] '{concept_name}' already exists in {kg_path}. Skipping.")
+                skipped += 1
+                continue
 
-        if dry_run:
-            print(f"\n--- DRY RUN OUTPUT for chunk {i} ---")
-            print(json.dumps(concept, indent=2, ensure_ascii=False))
-            print("------------------------------------")
+            if dry_run:
+                print(f"\n--- DRY RUN OUTPUT (chunk {i}) ---")
+                print(json.dumps(concept, indent=2, ensure_ascii=False))
+                print("----------------------------------")
+                added += 1
+                continue
+
+            # Append to knowledge
+            key                        = make_concept_key(concept_name, list(knowledge["concepts"].keys()))
+            knowledge["concepts"][key] = concept
+            print(f"[OK] Added concept '{concept_name}' as key '{key}'.")
             added += 1
-            continue
 
-        # Step 4 — Append to knowledge
-        key                              = make_concept_key(concept_name, list(knowledge["concepts"].keys()))
-        knowledge["concepts"][key]       = concept
-        print(f"[OK] Added concept '{concept_name}' as key '{key}'.")
-        added += 1
-
-        # Brief pause to avoid hammering the local model
+        # Brief pause between chunks to avoid hammering the local model
         time.sleep(0.5)
 
     # Step 5 — Save (unless dry-run)

@@ -28,18 +28,6 @@ PROFILE_FILE   = "student_profile.json"
 KNOWLEDGE_FILE = "knowledge.json"
 PDF_MIN_CHARS  = 500   # fail-fast guardrail threshold
 
-# Concept-specific home activity suggestions for the Parent Dashboard
-CONCEPT_ACTIVITIES: dict[str, str] = {
-    "The Book Corner": (
-        "Try a 'corner hunt' at home — find 5 objects with perfect L-shaped corners "
-        "(book spine, door frame, table edge) and trace each one with a finger."
-    ),
-    "The Earth's Invisible Tug": (
-        "Do a 'heavy vs light drop' experiment — hold a pencil and a crumpled paper ball "
-        "at the same height, then release both simultaneously. Talk about what you notice!"
-    ),
-}
-
 
 # ---------------------------------------------------------------------------
 # A. PERSISTENCE LAYER
@@ -241,8 +229,18 @@ IMPORTANT: Only use "give_up" when the student clearly and explicitly surrenders
 
 
 def compile_pip_prompt(concept_data: dict, state_directive: str) -> str:
-    """Build Pip's system prompt, injecting a dynamic state directive each turn."""
-    return f"""You are Pip, an enthusiastic 8-year-old trying to solve a puzzle.
+    """Build the persona's system prompt, injecting voice from persona_config each turn."""
+    persona = concept_data.get("persona_config", {
+        "name":       "Pip",
+        "age":        8,
+        "voice_tone": "curious 8-year-old, uses simple toy and playground analogies",
+    })
+    name       = persona.get("name", "Pip")
+    age        = persona.get("age", 8)
+    voice_tone = persona.get("voice_tone", "curious 8-year-old, uses simple analogies")
+
+    return f"""You are {name}, a {age}-year-old trying to solve a puzzle.
+Your voice and personality: {voice_tone}.
 The context of your puzzle is based on the initial story you were told.
 You are talking to a friend who is helping you figure it out.
 
@@ -252,7 +250,7 @@ you must NEVER give away the exact answer or vocabulary word. Wait for the user 
 
 SPEAKING RULES:
 - Maximum 3 short, simple sentences per reply.
-- Use the language of a real 8-year-old. No textbook words.
+- Fully adopt the voice and personality described above — no textbook language.
 - Stay in character as the confused puzzle-solver at all times.
 - End each reply with exactly ONE question to keep the conversation going.
 
@@ -445,6 +443,7 @@ def init_session_state() -> None:
         "session_won":           False,
         "game_started":          False,
         "pending_levels":        [],   # AI-generated concepts awaiting parent review
+        "current_concept_id":    None, # stable JSON key for the active concept
         "last_prompt":                "",     # debug: last prompt sent to Ollama
         "last_response":              "",     # debug: last raw response from Ollama
         "last_classification":        "None", # debug: last evaluator verdict
@@ -522,7 +521,7 @@ def render_chat_history() -> None:
 # G. PARENT DASHBOARD RENDERER
 # ---------------------------------------------------------------------------
 
-def render_dashboard() -> None:
+def render_dashboard(knowledge: dict) -> None:
     """Render the Parent Insights & Analytics view."""
     student_name = st.session_state.profile.get("student_name", "Explorer")
     achievements = st.session_state.profile.get("achievements", {})
@@ -550,14 +549,15 @@ def render_dashboard() -> None:
 
         # ── Progress Table ────────────────────────────────────────────────────
         st.subheader("📋 Concept Breakdown")
+        concepts_map = knowledge.get("concepts", {})
         table_rows = [
             {
-                "Concept":              concept_name,
+                "Concept":              concepts_map.get(cid, {}).get("name", cid),
                 "Status":               data.get("status", "Unknown"),
                 "Frustration Triggers": data.get("frustration_triggers", 0),
                 "Boss Fight Attempts":  data.get("boss_fight_attempts", 0),
             }
-            for concept_name, data in achievements.items()
+            for cid, data in achievements.items()
         ]
         st.dataframe(table_rows, use_container_width=True)
 
@@ -566,14 +566,16 @@ def render_dashboard() -> None:
         # ── Pedagogical Advice ────────────────────────────────────────────────
         st.subheader("💡 Suggested Home Activity")
 
-        hardest_name, hardest_stats = max(
+        hardest_id, hardest_stats = max(
             achievements.items(),
             key=lambda kv: kv[1].get("frustration_triggers", 0),
         )
-        friction = hardest_stats.get("frustration_triggers", 0)
-        activity = CONCEPT_ACTIVITIES.get(
-            hardest_name,
-            f"Revisit '{hardest_name}' together using everyday objects to build intuition!",
+        friction     = hardest_stats.get("frustration_triggers", 0)
+        hardest_data = knowledge.get("concepts", {}).get(hardest_id, {})
+        hardest_name = hardest_data.get("name", hardest_id)
+        activity     = hardest_data.get(
+            "home_activity",
+            f"Review '{hardest_name}' by looking for real-world examples around the house!",
         )
 
         if friction > 0:
@@ -604,6 +606,23 @@ def render_dashboard() -> None:
     if pending:
         st.subheader(f"🗂️ Concept Review Queue ({len(pending)} pending)")
         st.caption("Review each AI-generated concept before adding it to the game.")
+
+        if st.button("✅ Approve All Pending Levels", use_container_width=True):
+            knowledge = load_knowledge()
+            concepts  = knowledge.setdefault("concepts", {})
+            approved  = 0
+            for level in st.session_state.pending_levels:
+                new_key           = make_concept_key(
+                    level.get("concept_name", "New_Concept"),
+                    list(concepts.keys()),
+                )
+                entry             = {k: v for k, v in level.items() if k != "concept_name"}
+                concepts[new_key] = entry
+                approved         += 1
+            save_knowledge(knowledge)
+            st.session_state.pending_levels = []
+            st.success(f"✅ {approved} concept(s) added to knowledge.json!")
+            st.rerun()
 
         for i, level in enumerate(pending):
             with st.expander(f"📖 {level.get('concept_name', 'Untitled Concept')}", expanded=True):
@@ -736,8 +755,9 @@ def main() -> None:
         achievements = st.session_state.profile.get("achievements", {})
         if achievements:
             st.markdown("### 🏆 Trophy Room")
-            for concept_name in achievements:
-                st.markdown(f"⭐ **{concept_name}**")
+            for cid in achievements:
+                display = concepts.get(cid, {}).get("name", cid)
+                st.markdown(f"⭐ **{display}**")
             st.divider()
 
         # Game controls are only meaningful in Play mode
@@ -749,7 +769,9 @@ def main() -> None:
             )
 
             if st.button("▶ Start / Reset Puzzle", use_container_width=True, type="primary"):
-                concept_data = concepts[concept_keys[selected_idx]].copy()
+                selected_key = concept_keys[selected_idx]
+                st.session_state.current_concept_id = selected_key
+                concept_data = concepts[selected_key].copy()
 
                 # Scenario Polymorphism: pick a random variant if available
                 if "variants" in concept_data:
@@ -784,7 +806,7 @@ def main() -> None:
     # ════════════════════════════════════════════════════════════════════════
 
     if nav_view == "📊 Dashboard (Parent Mode)":
-        render_dashboard()
+        render_dashboard(knowledge)
         st.stop()
 
     # ── Play (Kid Mode) ───────────────────────────────────────────────────────
@@ -897,9 +919,12 @@ def main() -> None:
             # ── Phase 2 Mastery → TRUE WIN STATE ─────────────────────────────
             if st.session_state.current_phase == 2 and classification == "mastery":
 
-                # Persist the achievement to the student profile
-                concept_name = concept_data.get("name", "Unknown Concept")
-                st.session_state.profile["achievements"][concept_name] = {
+                # Persist the achievement keyed by the stable JSON concept ID
+                concept_id = st.session_state.get(
+                    "current_concept_id",
+                    concept_data.get("name", "Unknown_Concept"),
+                )
+                st.session_state.profile["achievements"][concept_id] = {
                     "status":               "Mastered",
                     "frustration_triggers": st.session_state.frustration_counter,
                     "boss_fight_attempts":  st.session_state.boss_fight_attempts,
