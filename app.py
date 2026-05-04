@@ -12,7 +12,11 @@ import io
 import json
 import os
 import random
+import re
 import requests
+from datetime import datetime, timezone
+import chromadb
+import ollama
 import streamlit as st
 from pypdf import PdfReader
 
@@ -21,12 +25,16 @@ from pypdf import PdfReader
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-OLLAMA_URL     = "http://localhost:11434/api/generate"
-MODEL_NAME     = "gemma4:e4b"
-TIMEOUT_SECS   = 120
-PROFILE_FILE   = "student_profile.json"
-KNOWLEDGE_FILE = "knowledge.json"
-PDF_MIN_CHARS  = 500   # fail-fast guardrail threshold
+OLLAMA_URL       = "http://localhost:11434/api/generate"
+MODEL_NAME       = "gemma4:e4b"
+EMBED_MODEL      = "nomic-embed-text"
+TIMEOUT_SECS     = 120
+PROFILE_FILE     = "student_profile.json"
+KNOWLEDGE_FILE   = "knowledge.json"
+CHROMA_PATH       = "./chroma_db"
+CHROMA_COLLECTION = "curriculum"
+DLQ_FILE          = "rejected_telemetry.jsonl"  # Dead Letter Queue — one JSON record per line
+PDF_MIN_CHARS     = 500            # fail-fast guardrail threshold
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +80,80 @@ def save_knowledge(knowledge: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CHROMADB HELPERS
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def get_chroma_collection() -> chromadb.Collection:
+    """
+    Open (or create) the persistent ChromaDB curriculum collection.
+    Cached by Streamlit so the client is reused across reruns.
+    """
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    return client.get_or_create_collection(name=CHROMA_COLLECTION)
+
+
+def _chroma_concept_id(concept_name: str) -> str:
+    """Derive a stable, URL-safe ChromaDB document ID from a concept name."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", concept_name.strip()).strip("_")[:60]
+    return slug if slug else "unnamed_concept"
+
+
+def _embed_and_upsert_concept(concept: dict, status: str = "pending") -> bool:
+    """
+    Generate a vector for the concept and upsert it into ChromaDB.
+    Returns True on success, False on failure (shows a Streamlit warning).
+    """
+    concept_name    = concept.get("name", "Untitled Concept")
+    searchable_text = (
+        f"{concept_name}: "
+        f"{concept.get('ground_truth_logic', concept.get('secret_fact', ''))}"
+    )
+    try:
+        response = ollama.embeddings(model=EMBED_MODEL, prompt=searchable_text)
+        vector   = response["embedding"]
+    except Exception as exc:
+        st.warning(f"⚠️ Embedding failed for '{concept_name}': {exc}")
+        return False
+
+    persona   = concept.get("persona_config", {})
+    metadata  = {
+        "concept_json":     json.dumps(concept, ensure_ascii=False),
+        "concept_name":     concept_name,
+        "complexity_level": persona.get("complexity_level", ""),
+        "persona_name":     persona.get("name", ""),
+        "status":           status,
+    }
+    collection = get_chroma_collection()
+    collection.upsert(
+        ids        = [_chroma_concept_id(concept_name)],
+        embeddings = [vector],
+        documents  = [searchable_text],
+        metadatas  = [metadata],
+    )
+    return True
+
+
+def write_dlq(item_id: str, concept: dict, rejection_reason: str) -> None:
+    """
+    Append one record to the Dead Letter Queue (dlq.jsonl).
+    Each line is a self-contained JSON object so the file can be streamed
+    or analysed with standard tools (jq, pandas, etc.).
+    """
+    record = {
+        "chroma_id":        item_id,
+        "rejected_at":      datetime.now(timezone.utc).isoformat(),
+        "rejection_reason": rejection_reason,
+        "concept":          concept,
+    }
+    try:
+        with open(DLQ_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        st.warning(f"⚠️ Could not write to DLQ ({DLQ_FILE}): {exc}")
+
+
+# ---------------------------------------------------------------------------
 # PDF INGESTION HELPERS
 # ---------------------------------------------------------------------------
 
@@ -83,31 +165,51 @@ def extract_pdf_text(uploaded_file) -> str:
 
 
 def compile_concept_generation_prompt(extracted_text: str) -> tuple[str, str]:
-    """Build the (system, user) prompt to turn raw PDF text into a game concept."""
+    """
+    Build the (system, user) prompt that turns raw PDF text into an array of
+    GemmaGenius concept objects — one per major section of the source material.
+    """
     system_prompt = """\
-You are an educational content designer who creates puzzles for children aged 6-12.
-Given source material, extract ONE key concept and design a complete GemmaGenius puzzle.
+You are an expert pedagogical AI. Your task is to extract educational concepts from the provided text and format them for an interactive learning game.
 
-OUTPUT RULES — respond with ONLY valid JSON, nothing else:
+### EXTRACTION RULES:
+1. Do NOT stop after one concept. You MUST extract a distinct concept for EVERY major section or numbered heading in the text.
+2. If the text has 4 sections, you must output 4 concepts in the array.
+
+### PERSONA SELECTION RULES:
+Analyze the reading level of the provided text to choose the correct persona for the student:
+- Primary/Ages 7-10: Persona = "Pip", Age 8. (Curious, uses toy/playground analogies).
+- Intermediate/Ages 11-14: Persona = "Alex", Age 13. (Slightly skeptical, uses sports/social/allowance analogies).
+- Advanced/Ages 15+: Persona = "Riley", Age 16. (The "Overzealous Detective", invents wild, confident but flawed theories).
+
+### TARGET SCHEMA:
+You must return ONLY a raw JSON object matching this exact structure. No markdown formatting.
+
 {
-  "name":                     "Short imaginative title (5 words or fewer)",
-  "secret_fact":              "One sentence: the core mechanism in plain language",
-  "goal":                     "What the student must understand to win",
-  "story_intro":              "Pip's opening puzzle (2-3 sentences as a confused 8-year-old, ends with a question)",
-  "story_bridge":             "Pip's celebration when Phase 1 is solved (1-2 sentences)",
-  "evaluator_ground_truth":   "Phase 1 ground truth: what the student must explain",
-  "verification_scenario":    "Pip's flawed Phase 2 scenario (2-3 sentences with a logical mistake, ends with 'right?')",
-  "verification_ground_truth":"Phase 2 ground truth: exactly why Pip's scenario is wrong"
+  "extracted_concepts": [
+    {
+      "concept_name": "Catchy Title",
+      "name": "Catchy Title",
+      "persona_config": {
+        "name": "[Pip, Alex, or Riley]",
+        "age": [8, 13, or 16],
+        "avatar_emoji": "[👧🏼, 👦🏽, or 🕵️]",
+        "voice_tone": "[Brief description of how they speak based on rules above]"
+      },
+      "story_intro": "The persona presents a confused scenario or flawed theory based on the concept.",
+      "ground_truth_logic": "The core fact the user must teach them.",
+      "verification_scenario": "A follow-up question where the persona tests their new understanding.",
+      "boss_fight_logic": "A logic trap where the persona makes a smart-sounding but incorrect assumption.",
+      "home_activity": "A simple real-world physical activity a parent and child can do together to explore this concept."
+    }
+  ]
 }
 
-STYLE RULES:
-- story_intro and verification_scenario must sound like a real confused 8-year-old, not a textbook.
-- Keep all text child-friendly and concrete — use physical objects and everyday situations.
-- verification_scenario must contain a clear, correctable misconception about the concept.
+If the source text does not contain enough content for even one meaningful concept, output: {"skip": true}
 """
     user_prompt = (
         f"SOURCE MATERIAL:\n{extracted_text[:8000]}\n\n"
-        "Generate the concept puzzle JSON:"
+        "Extract all key concepts and return the JSON:"
     )
     return system_prompt, user_prompt
 
@@ -501,10 +603,10 @@ def get_persona_avatar() -> str:
     return "👧🏼"
 
 
-def render_chat_history() -> None:
+def render_chat_history(persona_avatar: str = "👧🏼") -> None:
     """
     Render all messages in st.session_state.messages.
-      "assistant" → persona avatar (dynamic, from persona_config or fallback 👧🏼)
+      "assistant" → persona avatar passed in from the active concept's persona_config
       "user"      → student (avatar 👤)
       "system"    → phase/state banners as styled st.info boxes
     """
@@ -512,7 +614,7 @@ def render_chat_history() -> None:
         if message["role"] == "system":
             st.info(message["content"], icon="⚔️")
         else:
-            avatar = get_persona_avatar() if message["role"] == "assistant" else "👤"
+            avatar = persona_avatar if message["role"] == "assistant" else "👤"
             with st.chat_message(message["role"], avatar=avatar):
                 st.markdown(message["content"])
 
@@ -601,53 +703,91 @@ def render_dashboard(knowledge: dict) -> None:
             icon="🌱",
         )
 
-    # ── Review Queue ──────────────────────────────────────────────────────────
-    pending = st.session_state.pending_levels
-    if pending:
-        st.subheader(f"🗂️ Concept Review Queue ({len(pending)} pending)")
-        st.caption("Review each AI-generated concept before adding it to the game.")
+    # ── Review Queue (ChromaDB) ───────────────────────────────────────────────
+    try:
+        _collection   = get_chroma_collection()
+        pending_results = _collection.get(
+            where   = {"status": "pending"},
+            include = ["metadatas"],
+        )
+        pending_ids       = pending_results.get("ids", [])
+        pending_metadatas = pending_results.get("metadatas", [])
+    except Exception as exc:
+        st.warning(f"⚠️ Could not query ChromaDB review queue: {exc}")
+        pending_ids       = []
+        pending_metadatas = []
 
+    if pending_ids:
+        st.subheader(f"🗂️ Concept Review Queue ({len(pending_ids)} pending)")
+        st.caption("Review each AI-generated concept before it enters the active curriculum.")
+
+        # ── Approve All ──────────────────────────────────────────────────────
         if st.button("✅ Approve All Pending Levels", use_container_width=True):
-            knowledge = load_knowledge()
-            concepts  = knowledge.setdefault("concepts", {})
-            approved  = 0
-            for level in st.session_state.pending_levels:
-                new_key           = make_concept_key(
-                    level.get("concept_name", "New_Concept"),
-                    list(concepts.keys()),
+            collection = get_chroma_collection()
+            for item_id, meta in zip(pending_ids, pending_metadatas):
+                collection.update(
+                    ids       = [item_id],
+                    metadatas = [{**meta, "status": "approved"}],
                 )
-                entry             = {k: v for k, v in level.items() if k != "concept_name"}
-                concepts[new_key] = entry
-                approved         += 1
-            save_knowledge(knowledge)
-            st.session_state.pending_levels = []
-            st.success(f"✅ {approved} concept(s) added to knowledge.json!")
+            st.success(f"✅ {len(pending_ids)} concept(s) approved and added to the curriculum!")
             st.rerun()
 
-        for i, level in enumerate(pending):
-            with st.expander(f"📖 {level.get('concept_name', 'Untitled Concept')}", expanded=True):
-                st.markdown(f"**Pip's Opening Puzzle:**\n> {level.get('story_intro', '—')}")
-                st.markdown(f"**Boss Fight Scenario:**\n> {level.get('verification_scenario', '—')}")
+        # ── Per-concept cards ────────────────────────────────────────────────
+        for i, (item_id, meta) in enumerate(zip(pending_ids, pending_metadatas)):
+            try:
+                concept = json.loads(meta.get("concept_json", "{}"))
+            except json.JSONDecodeError:
+                concept = {}
 
-                btn_col1, btn_col2, _ = st.columns([1, 1, 4])
-                with btn_col1:
-                    if st.button("✅ Add to Game", key=f"add_{i}", use_container_width=True):
-                        knowledge = load_knowledge()
-                        concepts  = knowledge.setdefault("concepts", {})
-                        new_key   = make_concept_key(
-                            level.get("concept_name", "New_Concept"),
-                            list(concepts.keys()),
+            concept_name = meta.get("concept_name") or concept.get("name", "Untitled Concept")
+            persona_tag  = (
+                f"  ·  {meta['persona_name']} ({meta['complexity_level']})"
+                if meta.get("persona_name") else ""
+            )
+
+            with st.expander(f"📖 {concept_name}{persona_tag}", expanded=True):
+                st.markdown(f"**Opening Puzzle:**\n> {concept.get('story_intro', '—')}")
+                st.markdown(f"**Boss Fight Scenario:**\n> {concept.get('verification_scenario', '—')}")
+                if concept.get("home_activity"):
+                    st.markdown(f"**Home Activity:**\n> {concept['home_activity']}")
+
+                approve_col, reject_col = st.columns([1, 2])
+
+                with approve_col:
+                    if st.button("✅ Approve", key=f"approve_{item_id}",
+                                 use_container_width=True):
+                        get_chroma_collection().update(
+                            ids       = [item_id],
+                            metadatas = [{**meta, "status": "approved"}],
                         )
-                        # Store the full concept data (without our internal concept_name key)
-                        entry = {k: v for k, v in level.items() if k != "concept_name"}
-                        concepts[new_key] = entry
-                        save_knowledge(knowledge)
-                        del st.session_state.pending_levels[i]
-                        st.success(f"✅ '{level.get('concept_name')}' added to knowledge.json!")
+                        st.success(f"✅ '{concept_name}' approved!")
                         st.rerun()
-                with btn_col2:
-                    if st.button("🗑️ Discard", key=f"discard_{i}", use_container_width=True):
-                        del st.session_state.pending_levels[i]
+
+                with reject_col:
+                    reject_reason = st.selectbox(
+                        "Reason for Rejection",
+                        [
+                            "Hallucination / Factually Wrong",
+                            "Too Complex for Age Group",
+                            "Formatting / JSON Error",
+                            "Off-Topic or Irrelevant",
+                            "Other",
+                        ],
+                        key=f"reason_{item_id}",
+                        label_visibility="collapsed",
+                    )
+                    if st.button("🗑️ Reject & Delete", key=f"reject_{item_id}",
+                                 use_container_width=True):
+                        # 1. Write to the Dead Letter Queue file FIRST (before delete)
+                        write_dlq(item_id, concept, reject_reason)
+                        # 2. Remove the vector from ChromaDB entirely so it
+                        #    no longer pollutes the embedding space.
+                        get_chroma_collection().delete(ids=[item_id])
+                        st.warning(
+                            f"Concept **'{concept_name}'** rejected, logged to "
+                            f"`{DLQ_FILE}` for developer review, and purged from database.",
+                            icon="🗑️",
+                        )
                         st.rerun()
 
         st.divider()
@@ -685,12 +825,12 @@ def render_dashboard(knowledge: dict) -> None:
                 )
                 st.stop()
 
-            with st.spinner("AI is designing a puzzle from the PDF…"):
+            with st.spinner("AI is designing puzzles from the PDF…"):
                 sys_p, usr_p = compile_concept_generation_prompt(extracted_text)
                 raw_json     = call_ollama(sys_p, usr_p, json_mode=True)
 
             try:
-                concept = json.loads(raw_json)
+                parsed = json.loads(raw_json)
             except json.JSONDecodeError:
                 st.error(
                     "The AI returned malformed JSON. Try uploading a cleaner PDF "
@@ -699,13 +839,42 @@ def render_dashboard(knowledge: dict) -> None:
                 )
                 st.stop()
 
-            # Tag with a display name for the Review Queue expander title
-            concept["concept_name"] = concept.get("name", "Untitled Concept")
-            st.session_state.pending_levels.append(concept)
-            st.success(
-                f"✅ **'{concept['concept_name']}'** added to the Review Queue above. "
-                "Check the preview and click **Add to Game** when you're happy with it."
-            )
+            # Handle {skip: true} response
+            if parsed.get("skip"):
+                st.warning("The AI could not find enough content to create a concept. Try a richer PDF.")
+                st.stop()
+
+            # Support multi-concept array envelope OR legacy single-object fallback
+            concepts_to_embed = parsed.get("extracted_concepts")
+            if not concepts_to_embed:
+                # Legacy: bare single object
+                concepts_to_embed = [parsed]
+
+            embedded_count = 0
+            failed_names   = []
+            for concept in concepts_to_embed:
+                concept.setdefault("concept_name", concept.get("name", "Untitled Concept"))
+                concept.setdefault("name", concept["concept_name"])
+                with st.spinner(f"Embedding **'{concept['concept_name']}'**…"):
+                    ok = _embed_and_upsert_concept(concept, status="pending")
+                if ok:
+                    embedded_count += 1
+                else:
+                    failed_names.append(concept["concept_name"])
+
+            if embedded_count:
+                st.success(
+                    f"✅ **{embedded_count} concept(s)** added to the Review Queue. "
+                    "Scroll up to preview and approve them."
+                )
+            if failed_names:
+                st.error(
+                    f"Could not embed: {', '.join(failed_names)}. "
+                    "Make sure Ollama is running and `nomic-embed-text` is pulled.",
+                    icon="❌",
+                )
+            if not embedded_count:
+                st.stop()
             st.rerun()
 
 
@@ -810,9 +979,16 @@ def main() -> None:
         st.stop()
 
     # ── Play (Kid Mode) ───────────────────────────────────────────────────────
+    # Resolve persona from the active concept; fall back to Pip for legacy concepts
+    _concept      = st.session_state.get("concept_data") or {}
+    _persona      = _concept.get("persona_config", {})
+    persona_name  = _persona.get("name", "Pip")
+    persona_avatar = _persona.get("avatar_emoji", "👧🏼")
+
     st.title("GemmaGenius")
     st.caption(
-        "Explain the concept to Pip — she learns by asking questions, not by being told."
+        f"Explain the concept to {persona_name} — "
+        "they learn by asking questions, not by being told."
     )
 
     if not st.session_state.game_started:
@@ -820,12 +996,12 @@ def main() -> None:
         st.stop()
 
     # ── Render full chat history ──────────────────────────────────────────────
-    render_chat_history()
+    render_chat_history(persona_avatar)
 
     # ── Win state: show celebration and block further input ───────────────────
     if st.session_state.session_won:
         st.balloons()
-        st.success("⭐ TRUE MASTERY ACHIEVED! You explained the concept AND caught Pip's mistake!")
+        st.success(f"⭐ TRUE MASTERY ACHIEVED! You explained the concept AND caught {persona_name}'s mistake!")
         st.info("Choose a concept in the sidebar and click **Start / Reset Puzzle** to play again!")
         st.stop()
 
@@ -857,7 +1033,7 @@ def main() -> None:
                 st.session_state.pips_last_question = opening
                 st.session_state.messages.append({
                     "role":    "system",
-                    "content": "⚙️ Pip resets the puzzle... Let's try again!",
+                    "content": f"⚙️ {persona_name} resets the puzzle... Let's try again!",
                 })
                 st.session_state.messages.append({
                     "role":    "assistant",
@@ -876,7 +1052,7 @@ def main() -> None:
         st.stop()
 
     # ── Chat input ────────────────────────────────────────────────────────────
-    if user_input := st.chat_input("Explain it to Pip..."):
+    if user_input := st.chat_input(f"Explain it to {persona_name}..."):
 
         # 1. Append and immediately display the user's message
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -889,7 +1065,7 @@ def main() -> None:
         if st.session_state.current_phase == 2:
             st.session_state.boss_fight_attempts += 1
 
-        with st.spinner("Pip is thinking..."):
+        with st.spinner(f"{persona_name} is thinking..."):
 
             # 2. Call The Evaluator (phase-aware)
             eval_sys, eval_usr = compile_evaluator_prompt(
@@ -963,7 +1139,7 @@ def main() -> None:
                 pip_system   = compile_pip_prompt(concept_data, directive)
                 pip_response = call_ollama(pip_system, user_prompt=user_input, json_mode=False)
                 if not pip_response:
-                    pip_response = "[System] Pip could not respond. Please try again."
+                    pip_response = f"[System] {persona_name} could not respond. Please try again."
 
                 st.session_state.messages.append({"role": "assistant", "content": pip_response})
                 st.session_state.pips_last_question = pip_response
@@ -986,7 +1162,7 @@ def main() -> None:
                 pip_response = call_ollama(pip_system, user_prompt=user_input, json_mode=False)
 
                 if not pip_response:
-                    pip_response = "[System] Pip could not respond. Please try again."
+                    pip_response = f"[System] {persona_name} could not respond. Please try again."
 
                 st.session_state.messages.append({"role": "assistant", "content": pip_response})
                 st.session_state.pips_last_question = pip_response

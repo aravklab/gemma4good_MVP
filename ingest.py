@@ -1,22 +1,26 @@
 """
-ingest.py - Batch PDF to knowledge.json pipeline for GemmaGenius
-=================================================================
+ingest.py - Batch PDF to ChromaDB ingestion pipeline for GemmaGenius
+=====================================================================
 Reads a PDF, chunks it into paragraph blocks, sends each chunk to a
-local Ollama model, and appends the generated concept(s) to knowledge.json.
+local Ollama model (gemma4:e4b) to generate structured concept JSON,
+embeds each concept with nomic-embed-text, and upserts it into a local
+ChromaDB vector database.
 
 Usage:
     python ingest.py <path/to/file.pdf> [options]
 
 Options:
-    --dry-run         Print generated JSON to terminal; do NOT write to file.
-    --model NAME      Ollama model to use (default: gemma4:e4b).
-    --knowledge PATH  Path to knowledge.json (default: knowledge.json).
-    --max-chars N     Max characters per chunk (default: 3000).
-    --chunk-limit N   Process at most N chunks (default: all).
+    --dry-run            Print generated JSON to terminal; do NOT embed or write.
+    --model NAME         Ollama generation model (default: gemma4:e4b).
+    --embed-model NAME   Ollama embedding model (default: nomic-embed-text).
+    --chroma-path PATH   Directory for the ChromaDB store (default: ./chroma_db).
+    --collection NAME    ChromaDB collection name (default: curriculum).
+    --max-chars N        Max characters per chunk (default: 3000).
+    --chunk-limit N      Process at most N chunks (default: all).
 
 Examples:
     python ingest.py textbook_chapter.pdf --dry-run
-    python ingest.py notes.pdf --model llama3 --chunk-limit 3
+    python ingest.py notes.pdf --model gemma4:e4b --chunk-limit 3
 """
 
 import argparse
@@ -24,6 +28,7 @@ import json
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 # Ensure emoji and non-ASCII characters print safely on all platforms
@@ -32,6 +37,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import chromadb
+import ollama
 import requests
 from pypdf import PdfReader
 
@@ -40,11 +47,14 @@ from pypdf import PdfReader
 # CONFIGURATION DEFAULTS
 # ---------------------------------------------------------------------------
 
-OLLAMA_URL      = "http://localhost:11434/api/generate"
-DEFAULT_MODEL   = "gemma4:e4b"
-DEFAULT_KG_PATH = "knowledge.json"
-DEFAULT_MAX_CHARS = 3000
-TIMEOUT_SECS    = 180   # longer timeout for batch — chunks can be large
+OLLAMA_URL          = "http://localhost:11434/api/generate"
+DEFAULT_MODEL       = "gemma4:e4b"
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
+DEFAULT_CHROMA_PATH = "./chroma_db"
+DEFAULT_COLLECTION  = "curriculum"
+DEFAULT_MAX_CHARS   = 3000
+DEFAULT_OVERLAP     = 300   # characters of trailing context carried into the next chunk
+TIMEOUT_SECS        = 180   # longer timeout for batch — chunks can be large
 
 # ---------------------------------------------------------------------------
 # 1. EXTRACTION
@@ -72,69 +82,71 @@ def extract_text(pdf_path: str) -> str:
 # 2. CHUNKING
 # ---------------------------------------------------------------------------
 
-def chunk_text(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[str]:
+def semantic_chunk_text(
+    text:       str,
+    chunk_size: int = DEFAULT_MAX_CHARS,
+    overlap:    int = DEFAULT_OVERLAP,
+) -> list[str]:
     """
-    Split text into logical blocks no larger than max_chars.
+    Split text into semantically coherent chunks with a trailing overlap window.
 
-    Strategy:
-      1. Split on double newlines (paragraph breaks).
-      2. If a paragraph itself exceeds max_chars, split further on
-         single newlines, then on sentence boundaries.
-      3. Merge small consecutive paragraphs up to the max_chars limit.
+    Strategy
+    --------
+    1. Normalise whitespace and split on double newlines (paragraph / section breaks).
+    2. Accumulate paragraphs into a chunk until adding the next one would exceed
+       chunk_size.  When the chunk is full:
+         a. Save the current chunk.
+         b. Seed the next chunk with the trailing `overlap` characters of the saved
+            chunk, trimmed to a clean word boundary so the LLM never starts
+            mid-word.
+    3. Safety valve: if a single paragraph is itself larger than chunk_size it is
+       force-sliced to avoid an unbounded chunk.
+
+    The overlap window means a concept that straddles a paragraph boundary is
+    always fully present in at least one chunk, preventing the LLM from seeing
+    only half of an educational section.
     """
-    # Normalise whitespace
+    # Normalise line endings and collapse 3+ blank lines to 2
     text = re.sub(r"\r\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    raw_paragraphs: list[str] = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
-    # Sub-split any paragraph that exceeds max_chars
-    split_paragraphs: list[str] = []
-    for para in raw_paragraphs:
-        if len(para) <= max_chars:
-            split_paragraphs.append(para)
-        else:
-            # Try single-newline splits first
-            lines = [l.strip() for l in para.split("\n") if l.strip()]
-            current = ""
-            for line in lines:
-                if len(current) + len(line) + 1 <= max_chars:
-                    current = f"{current}\n{line}".strip()
-                else:
-                    if current:
-                        split_paragraphs.append(current)
-                    # If a single line is still too long, cut by sentence
-                    if len(line) > max_chars:
-                        sentences = re.split(r"(?<=[.!?])\s+", line)
-                        buf = ""
-                        for sent in sentences:
-                            if len(buf) + len(sent) + 1 <= max_chars:
-                                buf = f"{buf} {sent}".strip()
-                            else:
-                                if buf:
-                                    split_paragraphs.append(buf)
-                                buf = sent[:max_chars]
-                        if buf:
-                            split_paragraphs.append(buf)
-                    else:
-                        current = line
-            if current:
-                split_paragraphs.append(current)
-
-    # Merge consecutive small paragraphs
     chunks: list[str] = []
-    buffer = ""
-    for para in split_paragraphs:
-        if len(buffer) + len(para) + 2 <= max_chars:
-            buffer = f"{buffer}\n\n{para}".strip()
-        else:
-            if buffer:
-                chunks.append(buffer)
-            buffer = para
-    if buffer:
-        chunks.append(buffer)
+    current_chunk = ""
 
-    print(f"[INFO] Produced {len(chunks)} chunk(s) from the extracted text.")
+    for para in paragraphs:
+        if len(current_chunk) + len(para) < chunk_size:
+            # Still room — append with a paragraph separator
+            current_chunk = (current_chunk + "\n\n" + para).lstrip("\n")
+        else:
+            # Chunk is full — save it
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+
+            # Build the overlap seed from the tail of the saved chunk,
+            # snapped forward to the nearest word boundary
+            if overlap and len(current_chunk) > overlap:
+                tail = current_chunk[-overlap:]
+                # Advance past any partial word at the start of the tail
+                tail = tail.split(" ", 1)[-1] if " " in tail else tail
+            else:
+                tail = current_chunk
+
+            current_chunk = (tail + "\n\n" + para).lstrip("\n")
+
+            # Safety valve: a single paragraph that is itself too large
+            if len(current_chunk) > chunk_size:
+                chunks.append(current_chunk[:chunk_size].strip())
+                current_chunk = current_chunk[chunk_size:]
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    print(
+        f"[INFO] Produced {len(chunks)} semantic chunk(s) "
+        f"(chunk_size={chunk_size}, overlap={overlap})."
+    )
     return chunks
 
 
@@ -142,89 +154,43 @@ def chunk_text(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[str]:
 # 3. LLM CALL
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """\
-You are an expert curriculum designer for GemmaGenius, a Feynman Technique learning app.
+SYSTEM_PROMPT = """
+You are an expert pedagogical AI. Your task is to extract educational concepts from the provided text and format them for an interactive learning game.
 
-TASK: Read the provided text and identify the CORE distinct educational concepts.
-Extract between 1 and 3 concepts maximum (ignore minor trivia or repeated ideas).
+### EXTRACTION RULES:
+1. Do NOT stop after one concept. You MUST extract a distinct concept for EVERY major section or numbered heading in the text.
+2. If the text has 4 sections, you must output 4 concepts in the array.
 
-STEP 1 — COMPLEXITY DETECTION:
-Before writing any content, analyse the source text and classify it as exactly one of:
-  - "Primary"      : simple facts, basic vocabulary, early-school level
-  - "Intermediate" : multi-step reasoning, middle-school vocabulary, some domain terms
-  - "Advanced"     : technical mechanisms, high-school/university vocabulary, abstract logic
+### PERSONA SELECTION RULES:
+Analyze the reading level of the provided text to choose the correct persona for the student:
+- Primary/Ages 7-10: Persona = "Pip", Age 8. (Curious, uses toy/playground analogies).
+- Intermediate/Ages 11-14: Persona = "Alex", Age 13. (Slightly skeptical, uses sports/social/allowance analogies).
+- Advanced/Ages 15+: Persona = "Riley", Age 16. (The "Overzealous Detective", invents wild, confident but flawed theories).
 
-STEP 2 — PERSONA SELECTION:
-Based on the complexity level, select ONE persona that applies to ALL concepts in this chunk:
+### TARGET SCHEMA:
+You must return ONLY a raw JSON object matching this exact structure. No markdown formatting.
 
-  Primary   -> { "name": "Pip",  "age": 8,  "complexity_level": "Primary",
-                 "avatar_emoji": "🧒",
-                 "voice_tone": "Curious 8-year-old who uses toy and playground analogies" }
-
-  Intermediate -> { "name": "Alex", "age": 13, "complexity_level": "Intermediate",
-                    "avatar_emoji": "🧑‍🏫",
-                    "voice_tone": "Slightly skeptical 13-year-old who uses sports and social analogies" }
-
-  Advanced  -> { "name": "Riley", "age": 16, "complexity_level": "Advanced",
-                 "avatar_emoji": "🕵️",
-                 "voice_tone": "Overzealous detective who invents wild, confidently incorrect theories and demands the user confirm or debunk them" }
-
-STEP 3 — WRITE ALL STORY FIELDS for EACH concept in the selected persona's voice.
-The persona must be consistent across story_intro, story_bridge, variants, and verification_scenario
-for every concept in the array.
-
-TARGET SCHEMA:
 {
   "extracted_concepts": [
     {
-      "persona_config": {
-        "name": "<Pip | Alex | Riley>",
-        "age": <8 | 13 | 16>,
-        "complexity_level": "<Primary | Intermediate | Advanced>",
-        "avatar_emoji": "<emoji>",
-        "voice_tone": "<tone description>"
-      },
       "concept_name": "Catchy Title",
       "name": "Catchy Title",
-      "story_intro": "<persona> is in a real-world scenario confused by this topic.",
-      "story_bridge": "<persona>'s brief celebration when the student explains it correctly.",
-      "secret_fact": "The actual scientific or mathematical explanation in one sentence.",
-      "goal": "What the student must understand to win.",
-      "evaluator_ground_truth": "Phase 1 ground truth: what the student must explain.",
-      "variants": [
-        {
-          "story_intro": "Alternate scenario A in <persona>'s voice (same concept, different context).",
-          "verification_scenario": "<persona> applies the logic but makes a specific logical error. Ends with 'right?'",
-          "verification_ground_truth": "Why the variant scenario is wrong."
-        },
-        {
-          "story_intro": "Alternate scenario B in <persona>'s voice.",
-          "verification_scenario": "Another logical trap <persona> falls into.",
-          "verification_ground_truth": "Why this variant scenario is wrong."
-        }
-      ],
-      "verification_scenario": "<persona> applies the concept but makes a specific error. Ends with 'right?'",
-      "verification_ground_truth": "The specific error the student must catch and correct.",
-      "ground_truth_logic": "The actual scientific or mathematical explanation.",
-      "boss_fight_logic": "The specific misconception the student must debunk in Phase 2.",
+      "persona_config": {
+        "name": "[Pip, Alex, or Riley]",
+        "age": [8, 13, or 16],
+        "avatar_emoji": "[👧🏼, 👦🏽, or 🕵️]",
+        "voice_tone": "[Brief description of how they speak based on rules above]"
+      },
+      "story_intro": "The persona presents a confused scenario or flawed theory based on the concept.",
+      "ground_truth_logic": "The core fact the user must teach them.",
+      "verification_scenario": "A follow-up question where the persona tests their new understanding.",
+      "boss_fight_logic": "A logic trap where the persona makes a smart-sounding but incorrect assumption.",
       "home_activity": "A simple real-world physical activity a parent and child can do together to explore this concept."
     }
   ]
 }
 
-RULES:
-- Return an array of 1 to 3 concept objects inside "extracted_concepts". Never return more than 3.
-- ALL story text must match the chosen persona's age and voice_tone. Do not mix personas.
-- The verification_scenario must be a logical trap containing one clear correctable error.
-- RILEY-SPECIFIC RULE: When the persona is Riley, story_intro and verification_scenario must NOT be
-  simple questions. Riley must confidently present a wild, over-the-top, elaborately wrong theory
-  derived from the text — like a detective who has "cracked the case" but got it completely wrong.
-  Riley is energetic and sassy. End every Riley verification_scenario with "I've cracked the code,
-  haven't I?" instead of the standard "right?".
-- CRITICAL: Return ONLY the raw JSON object containing the 'extracted_concepts' array.
-  Do NOT wrap it in markdown formatting or add any conversational text before or after.
-- If the source text does not contain enough content for even one meaningful concept,
-  output: {"skip": true}
+If the source text does not contain enough content for even one meaningful concept, output: {"skip": true}
 """
 
 
@@ -344,48 +310,78 @@ def parse_concepts(raw: str, chunk_index: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 5. KNOWLEDGE.JSON HELPERS
+# 5. CHROMADB + EMBEDDING HELPERS
 # ---------------------------------------------------------------------------
 
-def load_knowledge(path: str) -> dict:
-    """Load knowledge.json; return an empty structure if the file is missing."""
-    kp = Path(path)
-    if not kp.exists():
-        print(f"[INFO] {path} not found — will create a new file.")
-        return {"concepts": {}}
-    try:
-        with kp.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except json.JSONDecodeError as exc:
-        print(f"[ERROR] {path} is malformed: {exc}", file=sys.stderr)
-        sys.exit(1)
+def get_collection(chroma_path: str, collection_name: str) -> chromadb.Collection:
+    """Open (or create) a persistent ChromaDB collection."""
+    client = chromadb.PersistentClient(path=chroma_path)
+    collection = client.get_or_create_collection(name=collection_name)
+    print(f"[INFO] ChromaDB collection '{collection_name}' ready at '{chroma_path}' "
+          f"({collection.count()} existing document(s)).")
+    return collection
 
 
-def save_knowledge(knowledge: dict, path: str) -> None:
-    """Write the knowledge dict back to disk."""
-    with Path(path).open("w", encoding="utf-8") as fh:
-        json.dump(knowledge, fh, indent=2, ensure_ascii=False)
-    print(f"[INFO] Saved {path}")
+def _concept_id(concept_name: str) -> str:
+    """
+    Derive a stable, URL-safe ID from a concept name.
+    Identical names always map to the same ID, making upsert naturally idempotent.
+    Falls back to a UUID suffix if the name is blank.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", concept_name.strip()).strip("_")[:60]
+    return slug if slug else uuid.uuid4().hex
 
 
-def make_concept_key(name: str, existing_keys: list[str]) -> str:
-    """Generate a unique CamelCase-ish key for the concepts dict."""
-    sanitized = "_".join(name.split())[:30]
-    n         = len(existing_keys) + 1
-    candidate = f"C{n}_{sanitized}"
-    while candidate in existing_keys:
-        n        += 1
-        candidate = f"C{n}_{sanitized}"
-    return candidate
+def _flatten_metadata(concept: dict) -> dict:
+    """
+    ChromaDB metadata values must be flat scalars (str, int, float, bool).
+    Serialize the full concept as a JSON string so it can be reconstructed,
+    and surface a few key fields as queryable flat strings.
 
-
-def is_duplicate(concept_name: str, knowledge: dict) -> bool:
-    """Return True if concept_name already exists in knowledge.json."""
-    existing_names = {
-        v.get("name", "").lower()
-        for v in knowledge.get("concepts", {}).values()
+    All concepts enter as "pending" so the Parent Dashboard can gate them
+    before they become part of the active curriculum.
+    """
+    persona = concept.get("persona_config", {})
+    return {
+        "concept_json":     json.dumps(concept, ensure_ascii=False),
+        "concept_name":     concept.get("name", ""),
+        "complexity_level": persona.get("complexity_level", ""),
+        "persona_name":     persona.get("name", ""),
+        "status":           "pending",
     }
-    return concept_name.lower() in existing_names
+
+
+def embed_and_upsert(
+    concept:      dict,
+    collection:   chromadb.Collection,
+    embed_model:  str,
+) -> None:
+    """
+    Generate a vector embedding for one concept and upsert it into ChromaDB.
+    The searchable document combines the concept name + its ground-truth logic.
+    """
+    concept_name    = concept.get("name", "Unnamed Concept")
+    searchable_text = (
+        f"{concept_name}: "
+        f"{concept.get('ground_truth_logic', concept.get('secret_fact', ''))}"
+    )
+
+    try:
+        response = ollama.embeddings(model=embed_model, prompt=searchable_text)
+        vector   = response["embedding"]
+    except Exception as exc:
+        print(f"[WARN] Embedding failed for '{concept_name}': {exc}. Skipping.", file=sys.stderr)
+        return
+
+    doc_id = _concept_id(concept_name)
+
+    collection.upsert(
+        ids        = [doc_id],
+        embeddings = [vector],
+        documents  = [searchable_text],
+        metadatas  = [_flatten_metadata(concept)],
+    )
+    print(f"[OK] Embedded and upserted '{concept_name}' (id={doc_id}).")
 
 
 # ---------------------------------------------------------------------------
@@ -393,40 +389,46 @@ def is_duplicate(concept_name: str, knowledge: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def run(
-    pdf_path:    str,
-    model:       str,
-    kg_path:     str,
-    max_chars:   int,
-    chunk_limit: int | None,
-    dry_run:     bool,
+    pdf_path:        str,
+    model:           str,
+    embed_model:     str,
+    chroma_path:     str,
+    collection_name: str,
+    max_chars:       int,
+    overlap:         int,
+    chunk_limit:     int | None,
+    dry_run:         bool,
 ) -> None:
     print("=" * 60)
-    print("GemmaGenius — PDF Ingestion Pipeline")
+    print("GemmaGenius — PDF Ingestion Pipeline (ChromaDB)")
     if dry_run:
-        print("  *** DRY RUN MODE — nothing will be written to disk ***")
+        print("  *** DRY RUN MODE — nothing will be embedded or written ***")
     print("=" * 60)
 
-    # Step 1 — Extract
+    # Step 1 — Extract text from PDF
     full_text = extract_text(pdf_path)
     if len(full_text) < 200:
         print("[ERROR] Extracted text is too short to be useful. Aborting.", file=sys.stderr)
         sys.exit(1)
 
-    # Step 2 — Chunk
-    chunks = chunk_text(full_text, max_chars=max_chars)
+    # Step 2 — Semantic chunking with overlap
+    chunks = semantic_chunk_text(full_text, chunk_size=max_chars, overlap=overlap)
     if chunk_limit:
         chunks = chunks[:chunk_limit]
         print(f"[INFO] Processing first {len(chunks)} chunk(s) (--chunk-limit applied).")
 
-    # Step 3 — Load existing knowledge (needed for duplicate check even in dry-run)
-    knowledge = load_knowledge(kg_path)
+    # Step 3 — Connect to ChromaDB (skip in dry-run to avoid creating an empty store)
+    collection = None
+    if not dry_run:
+        collection = get_collection(chroma_path, collection_name)
 
-    added   = 0
-    skipped = 0
+    embedded = 0
+    skipped  = 0
 
     for i, chunk in enumerate(chunks, start=1):
-        print(f"\n[{i}/{len(chunks)}] Sending chunk to {model}…")
+        print(f"\nProcessing logical chunk {i} of {len(chunks)}…  (sending to {model})")
 
+        # Step 4a — Generate structured concept JSON via Gemma
         raw      = call_ollama(chunk, model)
         concepts = parse_concepts(raw, chunk_index=i)
 
@@ -435,38 +437,28 @@ def run(
             continue
 
         for concept in concepts:
-            concept_name = concept["name"]
-
-            # Duplicate guard (re-checked after every addition so keys stay fresh)
-            if is_duplicate(concept_name, knowledge):
-                print(f"[SKIP] '{concept_name}' already exists in {kg_path}. Skipping.")
-                skipped += 1
-                continue
-
             if dry_run:
                 print(f"\n--- DRY RUN OUTPUT (chunk {i}) ---")
                 print(json.dumps(concept, indent=2, ensure_ascii=False))
                 print("----------------------------------")
-                added += 1
+                embedded += 1
                 continue
 
-            # Append to knowledge
-            key                        = make_concept_key(concept_name, list(knowledge["concepts"].keys()))
-            knowledge["concepts"][key] = concept
-            print(f"[OK] Added concept '{concept_name}' as key '{key}'.")
-            added += 1
+            # Step 4b — Embed with nomic-embed-text and upsert to ChromaDB
+            embed_and_upsert(concept, collection, embed_model)
+            embedded += 1
 
         # Brief pause between chunks to avoid hammering the local model
         time.sleep(0.5)
 
-    # Step 5 — Save (unless dry-run)
-    if not dry_run and added > 0:
-        save_knowledge(knowledge, kg_path)
-
     print("\n" + "=" * 60)
-    print(f"Done.  Added: {added}   Skipped: {skipped}   Total chunks: {len(chunks)}")
+    print(f"Done.  Embedded: {embedded}   Skipped (empty/error): {skipped}   "
+          f"Total chunks: {len(chunks)}")
+    if not dry_run and embedded > 0:
+        print(f"Concepts are stored in ChromaDB at '{chroma_path}' "
+              f"(collection: '{collection_name}').")
     if dry_run:
-        print("Dry run complete — no files were modified.")
+        print("Dry run complete — no data was written to ChromaDB.")
     print("=" * 60)
 
 
@@ -476,20 +468,27 @@ def run(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Batch-ingest a PDF into GemmaGenius knowledge.json via local Ollama.",
+        description="Batch-ingest a PDF into GemmaGenius ChromaDB via local Ollama.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("pdf_path",                  help="Path to the PDF file to ingest.")
-    p.add_argument("--dry-run",   action="store_true",
-                   help="Print generated JSON to terminal; do NOT write to knowledge.json.")
-    p.add_argument("--model",     default=DEFAULT_MODEL,
-                   help=f"Ollama model to use (default: {DEFAULT_MODEL}).")
-    p.add_argument("--knowledge", default=DEFAULT_KG_PATH,
-                   help=f"Path to knowledge.json (default: {DEFAULT_KG_PATH}).")
-    p.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS,
+    p.add_argument("pdf_path",
+                   help="Path to the PDF file to ingest.")
+    p.add_argument("--dry-run",       action="store_true",
+                   help="Print generated JSON to terminal; do NOT embed or write to ChromaDB.")
+    p.add_argument("--model",         default=DEFAULT_MODEL,
+                   help=f"Ollama generation model (default: {DEFAULT_MODEL}).")
+    p.add_argument("--embed-model",   default=DEFAULT_EMBED_MODEL,
+                   help=f"Ollama embedding model (default: {DEFAULT_EMBED_MODEL}).")
+    p.add_argument("--chroma-path",   default=DEFAULT_CHROMA_PATH,
+                   help=f"Directory for the ChromaDB store (default: {DEFAULT_CHROMA_PATH}).")
+    p.add_argument("--collection",    default=DEFAULT_COLLECTION,
+                   help=f"ChromaDB collection name (default: {DEFAULT_COLLECTION}).")
+    p.add_argument("--max-chars",     type=int, default=DEFAULT_MAX_CHARS,
                    help=f"Max characters per chunk (default: {DEFAULT_MAX_CHARS}).")
-    p.add_argument("--chunk-limit", type=int, default=None,
+    p.add_argument("--overlap",       type=int, default=DEFAULT_OVERLAP,
+                   help=f"Overlap characters carried into each new chunk (default: {DEFAULT_OVERLAP}).")
+    p.add_argument("--chunk-limit",   type=int, default=None,
                    help="Process at most N chunks (default: all).")
     return p
 
@@ -497,10 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = build_parser().parse_args()
     run(
-        pdf_path    = args.pdf_path,
-        model       = args.model,
-        kg_path     = args.knowledge,
-        max_chars   = args.max_chars,
-        chunk_limit = args.chunk_limit,
-        dry_run     = args.dry_run,
+        pdf_path        = args.pdf_path,
+        model           = args.model,
+        embed_model     = args.embed_model,
+        chroma_path     = args.chroma_path,
+        collection_name = args.collection,
+        max_chars       = args.max_chars,
+        overlap         = args.overlap,
+        chunk_limit     = args.chunk_limit,
+        dry_run         = args.dry_run,
     )

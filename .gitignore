@@ -7,3 +7,9 @@ venv/
 *.egg-info/
 .DS_Store
 Thumbs.db
+
+# Local ChromaDB vector store (binary, machine-specific)
+chroma_db/
+
+# Test / sample PDFs
+*.pdf
