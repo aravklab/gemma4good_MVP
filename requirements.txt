@@ -1,0 +1,24 @@
+# GemmaGenius — direct runtime dependencies
+# Install with: pip install -r requirements.txt
+#
+# After installing, also pull the required Ollama models:
+#   ollama pull gemma4:e4b
+#   ollama pull nomic-embed-text
+
+# Web UI
+streamlit==1.56.0
+
+# PDF text extraction (app.py + ingest.py)
+pypdf==6.10.2
+
+# Ollama HTTP calls (app.py + ingest.py)
+requests==2.33.1
+
+# Ollama Python client — embeddings (app.py + ingest.py)
+ollama==0.6.2
+
+# Local vector store (app.py + ingest.py)
+chromadb==1.5.8
+
+# Parent Dashboard dataframe rendering (app.py)
+pandas==3.0.2
