@@ -947,12 +947,17 @@ def main() -> None:
     concept_names = [concepts[k]["name"] for k in concept_keys]
 
     # ── Build subject-grouped index for the sidebar folder UI ─────────────────
-    # ChromaDB concepts carry a "subject" field; legacy ones default to "Classic"
+    # ChromaDB concepts carry "subject" and "sequence_order" fields.
+    # Legacy hand-authored concepts default to "Classic" subject, order 999.
     grouped_concepts: dict[str, list[tuple[str, dict]]] = {}
     for key in concept_keys:
         concept_obj = concepts[key]
         subject = concept_obj.get("subject", "Classic" if key in legacy_concepts else "General")
         grouped_concepts.setdefault(subject, []).append((key, concept_obj))
+
+    # Sort concepts within each subject by their sequence_order
+    for subject in grouped_concepts:
+        grouped_concepts[subject].sort(key=lambda x: int(x[1].get("sequence_order", 999)))
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -981,29 +986,59 @@ def main() -> None:
         if nav_view == "🎮 Play (Kid Mode)":
             if grouped_concepts:
                 st.subheader("📚 My Subjects")
+                active_id    = st.session_state.get("current_concept_id")
+                achievements = st.session_state.profile.get("achievements", {})
+
                 for subject, items in sorted(grouped_concepts.items()):
-                    # Keep subject folders open if one of their concepts is active
-                    active_id  = st.session_state.get("current_concept_id")
-                    is_active  = any(cid == active_id for cid, _ in items)
-                    with st.expander(f"📁 {subject} ({len(items)})", expanded=is_active):
+                    # Keep folder open if it contains the currently active concept
+                    is_active_folder = any(cid == active_id for cid, _ in items)
+                    # Also keep open if any concept inside is unlocked (not all locked)
+                    with st.expander(f"📁 {subject} ({len(items)})", expanded=is_active_folder):
+                        # First concept in each subject is always unlocked
+                        previous_mastered = True
+
                         for cid, concept_obj in items:
-                            concept_name = concept_obj.get("name", cid)
-                            # Highlight the currently playing concept
-                            label = f"▶ {concept_name}" if cid == active_id else concept_name
-                            if st.button(label, key=f"nav_{cid}",
-                                         use_container_width=True):
-                                st.session_state.current_concept_id = cid
-                                concept_data = concept_obj.copy()
+                            concept_name  = concept_obj.get("name", cid)
+                            is_mastered   = cid in achievements
+                            is_playing    = cid == active_id
 
-                                # Scenario Polymorphism: pick a random variant if available
-                                if "variants" in concept_data:
-                                    variant = random.choice(concept_data["variants"])
-                                    concept_data["story_intro"]               = variant["story_intro"]
-                                    concept_data["verification_scenario"]     = variant["verification_scenario"]
-                                    concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+                            if previous_mastered:
+                                # ── UNLOCKED ───────────────────────────────
+                                if is_mastered:
+                                    icon = "⭐"
+                                elif is_playing:
+                                    icon = "▶"
+                                else:
+                                    icon = "○"
 
-                                start_session(concept_data)
-                                st.rerun()
+                                if st.button(
+                                    f"{icon} {concept_name}",
+                                    key=f"nav_{cid}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state.current_concept_id = cid
+                                    concept_data = concept_obj.copy()
+
+                                    # Scenario Polymorphism
+                                    if "variants" in concept_data:
+                                        variant = random.choice(concept_data["variants"])
+                                        concept_data["story_intro"]               = variant["story_intro"]
+                                        concept_data["verification_scenario"]     = variant["verification_scenario"]
+                                        concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+
+                                    start_session(concept_data)
+                                    st.rerun()
+                            else:
+                                # ── LOCKED ─────────────────────────────────
+                                st.button(
+                                    f"🔒 {concept_name}",
+                                    key=f"lock_{cid}",
+                                    use_container_width=True,
+                                    disabled=True,
+                                )
+
+                            # This concept's mastery unlocks (or keeps locked) the next
+                            previous_mastered = is_mastered
             else:
                 st.info("No concepts approved yet. Ask a parent to add some in the Dashboard!", icon="📖")
 

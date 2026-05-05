@@ -349,6 +349,7 @@ def _flatten_metadata(concept: dict) -> dict:
         "complexity_level": persona.get("complexity_level", ""),
         "persona_name":     persona.get("name", ""),
         "subject":          concept.get("subject", "General"),
+        "sequence_order":   int(concept.get("sequence_order", 999)),
         "status":           "pending",
     }
 
@@ -425,8 +426,9 @@ def run(
     if not dry_run:
         collection = get_collection(chroma_path, collection_name)
 
-    embedded = 0
-    skipped  = 0
+    embedded         = 0
+    skipped          = 0
+    current_sequence = 1   # global sequence across all chunks — tracks linear order
 
     for i, chunk in enumerate(chunks, start=1):
         print(f"\nProcessing logical chunk {i} of {len(chunks)}…  (sending to {model})")
@@ -440,19 +442,23 @@ def run(
             continue
 
         for concept in concepts:
-            # Stamp the subject tag before embedding / dry-run output
-            concept["subject"] = subject
+            # Stamp subject and linear sequence order before embedding / dry-run output
+            concept["subject"]        = subject
+            concept["sequence_order"] = current_sequence
 
             if dry_run:
-                print(f"\n--- DRY RUN OUTPUT (chunk {i}) ---")
+                print(f"\n--- DRY RUN OUTPUT (chunk {i}, sequence {current_sequence}) ---")
                 print(json.dumps(concept, indent=2, ensure_ascii=False))
                 print("----------------------------------")
                 embedded += 1
+                current_sequence += 1
                 continue
 
             # Step 4b — Embed with nomic-embed-text and upsert to ChromaDB
             embed_and_upsert(concept, collection, embed_model)
             embedded += 1
+
+            current_sequence += 1  # increment after each valid concept
 
         # Brief pause between chunks to avoid hammering the local model
         time.sleep(0.5)
