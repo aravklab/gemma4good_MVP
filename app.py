@@ -775,7 +775,8 @@ def init_session_state() -> None:
         "voice_enabled":   False,  # TTS: off by default — user opts in via Audio Settings
         "mic_enabled":     False,  # STT: show microphone recorder widget
         "last_spoken_idx": -1,     # TTS: index of last message already spoken (avoids replay on rerun)
-        "last_audio_hash": "",     # STT: MD5 of last processed audio — prevents double-submission on rerun
+        "last_audio_hash":        "",   # STT: MD5 of last processed audio — prevents double-submission on rerun
+        "pending_transcription":  "",   # STT: transcribed text waiting for user to review/edit before sending
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -803,6 +804,7 @@ def start_session(concept_data: dict) -> None:
     st.session_state.session_won           = False
     st.session_state.game_started          = True
     st.session_state.last_spoken_idx       = -1  # reset TTS pointer for the new session
+    st.session_state.pending_transcription = ""  # clear any stale mic draft
 
     st.session_state.messages.append({
         "role":    "assistant",
@@ -1646,36 +1648,91 @@ def main() -> None:
     user_input: str | None = None
 
     if st.session_state.get("mic_enabled") and AUDIO_RECORDER_AVAILABLE:
+        # Pulsing animation injected into the page — visible while mic mode is active.
+        # Because the recorder widget lives inside a cross-origin iframe we cannot
+        # detect its internal recording/idle state from JS, so we pulse the ring
+        # continuously while mic mode is on. The red→dark-green button color change
+        # inside the widget is the definitive signal.
+        st.markdown("""
+<style>
+@keyframes mic-pulse {
+    0%   { box-shadow: 0 0 0 0  rgba(232,65,24,.65); }
+    60%  { box-shadow: 0 0 0 10px rgba(232,65,24,.0); }
+    100% { box-shadow: 0 0 0 0  rgba(232,65,24,.0); }
+}
+/* Target the container div that Streamlit wraps around the second column */
+div[data-testid="stHorizontalBlock"] > div:nth-child(2) {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+}
+div[data-testid="stHorizontalBlock"] > div:nth-child(2) iframe {
+    border-radius: 50%;
+    animation: mic-pulse 1.6s ease-out infinite;
+}
+</style>""", unsafe_allow_html=True)
+
         # Side-by-side layout: wide text input + narrow mic button
         input_col, mic_col = st.columns([6, 1])
         with input_col:
             user_text = st.chat_input(f"Explain it to {persona_name}...")
         with mic_col:
+            # neutral_color = bright green so the switch to red is unmissable
             audio_bytes = _audio_recorder(
                 text="",
-                recording_color="#e84118",
-                neutral_color="#353b48",
+                recording_color="#e84118",   # vivid red  → recording
+                neutral_color="#1a9e5c",     # vivid green → ready / idle
                 icon_size="2x",
-                pause_threshold=4.0,   # wait 4 s of silence before auto-stop (default 2s cut kids off mid-thought)
+                pause_threshold=4.0,
                 key="mic_recorder",
             )
-        # Instruction label — shows when no transcription is pending
-        st.caption("🔴 **Recording:** Click mic → speak → click again to stop &nbsp;|&nbsp; Auto-stops after 4 s of silence")
 
-        # Typed input wins; fall back to transcribed voice.
-        # Guard: hash the audio bytes so a rerun after st.rerun() doesn't
-        # re-submit the same recording a second time (audio_recorder_streamlit
-        # holds its state across reruns until a new recording is made).
+        # Status legend below the mic — always visible
+        st.markdown(
+            "<div style='text-align:center; font-size:0.78rem; color:#888; margin-top:2px;'>"
+            "🟢 <b>ready</b> &nbsp;·&nbsp; 🔴 <b>recording</b>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Tap mic to **start** — tap again (or wait 4 s of silence) to **stop**"
+        )
+
+        # ── Step 1: capture a new recording ───────────────────────────────────
+        # Typed text always wins.  For audio we hash the bytes so a Streamlit
+        # rerun doesn't re-submit the same clip a second time.
         if user_text:
             user_input = user_text
+            st.session_state.pending_transcription = ""   # clear any pending draft
         elif audio_bytes:
             audio_hash = hashlib.md5(audio_bytes).hexdigest()
             if audio_hash != st.session_state.get("last_audio_hash", ""):
                 st.session_state.last_audio_hash = audio_hash
-                with st.spinner("Transcribing..."):
-                    user_input = transcribe_audio(audio_bytes)
-                if user_input:
-                    st.info(f"🎤 Heard: *\"{user_input}\"*", icon="✅")
+                with st.spinner("Transcribing…"):
+                    transcribed = transcribe_audio(audio_bytes)
+                if transcribed:
+                    st.session_state.pending_transcription = transcribed
+                    st.rerun()   # re-render to show the edit box immediately
+
+        # ── Step 2: let the user review / edit before sending ─────────────────
+        if st.session_state.get("pending_transcription"):
+            st.info("✏️ **Review your transcription** — edit if needed, then send.", icon="🎤")
+            edited_text = st.text_area(
+                label="Your words (edit freely):",
+                value=st.session_state.pending_transcription,
+                height=80,
+                key="transcription_editor",
+                label_visibility="collapsed",
+            )
+            send_col, retry_col, _ = st.columns([2, 2, 5])
+            with send_col:
+                if st.button("Send ✓", use_container_width=True, type="primary"):
+                    user_input = edited_text.strip()
+                    st.session_state.pending_transcription = ""
+            with retry_col:
+                if st.button("Re-record ✗", use_container_width=True):
+                    st.session_state.pending_transcription = ""
+                    st.rerun()
     else:
         user_input = st.chat_input(f"Explain it to {persona_name}...")
 
