@@ -320,12 +320,15 @@ Choose exactly ONE value from this list:
   "mastery"     — Student clearly explained the core mechanism required by the ground truth. (Childlike language is fine).
   "partial_hit" — Student mentions relevant ideas or vocabulary, but the explanation is incomplete, vague, or missing the core logical mechanism defined in the ground truth.
   "miss"        — Student is wrong, confused, guessing blindly, or merely parroting the vocabulary word without explaining how it actually works.
-  "question"    — Student is asking a clarifying question about the concept or the puzzle.
+  "question"    — Student is asking a clarifying question, OR asking for a hint, clue, or nudge (e.g. "can you give me a hint?", "a little hint please", "give me a clue"). Hint requests are ALWAYS "question", never "give_up".
   "off_topic"   — Student is joking, typing nonsense, or talking about something completely unrelated to the current task.
-  "give_up"     — Student explicitly says "I don't know", "tell me", "you explain it", or expresses deep frustration and a desire to quit the puzzle.
+  "give_up"     — Student explicitly and unambiguously surrenders: says "I give up", "I don't know, just tell me", "you explain it", "I quit", or uses language that clearly means they want to stop trying entirely.
 
 Be strict but fair. Do not guess intent — classify what was actually said.
-IMPORTANT: Only use "give_up" when the student clearly and explicitly surrenders. A wrong answer is still a "miss", not a "give_up".
+CRITICAL RULES:
+- Asking for a hint is ALWAYS "question". Never classify hint requests as "give_up".
+- A wrong answer is always "miss", not "give_up".
+- Only use "give_up" when the student clearly and explicitly quits with no attempt remaining.
 """
 
     user_prompt = (
