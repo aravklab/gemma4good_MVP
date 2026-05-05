@@ -989,21 +989,31 @@ def main() -> None:
                 active_id    = st.session_state.get("current_concept_id")
                 achievements = st.session_state.profile.get("achievements", {})
 
+                LOOK_AHEAD = 3  # next 1 immediate + 2 exploratory levels
+
                 for subject, items in sorted(grouped_concepts.items()):
-                    # Keep folder open if it contains the currently active concept
                     is_active_folder = any(cid == active_id for cid, _ in items)
-                    # Also keep open if any concept inside is unlocked (not all locked)
                     with st.expander(f"📁 {subject} ({len(items)})", expanded=is_active_folder):
-                        # First concept in each subject is always unlocked
-                        previous_mastered = True
 
+                        # ── Pass 1: find the highest mastered sequence in this folder ──
+                        max_mastered_seq = 0
                         for cid, concept_obj in items:
-                            concept_name  = concept_obj.get("name", cid)
-                            is_mastered   = cid in achievements
-                            is_playing    = cid == active_id
+                            if cid in achievements:
+                                seq = int(concept_obj.get("sequence_order", 0))
+                                if seq > max_mastered_seq:
+                                    max_mastered_seq = seq
 
-                            if previous_mastered:
-                                # ── UNLOCKED ───────────────────────────────
+                        # ── Pass 2: render with look-ahead buffer ──────────────────────
+                        for cid, concept_obj in items:
+                            concept_name = concept_obj.get("name", cid)
+                            seq          = int(concept_obj.get("sequence_order", 999))
+                            is_mastered  = cid in achievements
+                            is_playing   = cid == active_id
+
+                            # Unlocked if already mastered OR within the buffer window
+                            is_unlocked = is_mastered or (seq <= max_mastered_seq + LOOK_AHEAD)
+
+                            if is_unlocked:
                                 if is_mastered:
                                     icon = "⭐"
                                 elif is_playing:
@@ -1029,16 +1039,12 @@ def main() -> None:
                                     start_session(concept_data)
                                     st.rerun()
                             else:
-                                # ── LOCKED ─────────────────────────────────
                                 st.button(
                                     f"🔒 {concept_name}",
                                     key=f"lock_{cid}",
                                     use_container_width=True,
                                     disabled=True,
                                 )
-
-                            # This concept's mastery unlocks (or keeps locked) the next
-                            previous_mastered = is_mastered
             else:
                 st.info("No concepts approved yet. Ask a parent to add some in the Dashboard!", icon="📖")
 
