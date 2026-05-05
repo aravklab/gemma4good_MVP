@@ -96,17 +96,31 @@ KEY SESSION STATE KEYS
   game_started          True once Start/Reset has been triggered
 """
 
+import hashlib
 import io
 import json
 import os
 import random
 import re
 import requests
+import tempfile
 from datetime import datetime, timezone
 import chromadb
 import ollama
 import streamlit as st
 from pypdf import PdfReader
+
+try:
+    from audio_recorder_streamlit import audio_recorder as _audio_recorder
+    AUDIO_RECORDER_AVAILABLE = True
+except ImportError:
+    AUDIO_RECORDER_AVAILABLE = False
+
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +131,17 @@ OLLAMA_URL       = "http://localhost:11434/api/generate"
 MODEL_NAME       = "gemma4:e4b"
 EMBED_MODEL      = "nomic-embed-text"
 TIMEOUT_SECS     = 120
-PROFILE_FILE     = "student_profile.json"
-KNOWLEDGE_FILE   = "knowledge.json"
+PROFILE_FILE      = "student_profile.json"
+KNOWLEDGE_FILE    = "knowledge.json"
 CHROMA_PATH       = "./chroma_db"
 CHROMA_COLLECTION = "curriculum"
 DLQ_FILE          = "rejected_telemetry.jsonl"  # Dead Letter Queue — one JSON record per line
 PDF_MIN_CHARS     = 500            # fail-fast guardrail threshold
+
+# Local Whisper model path — populated by scripts/download_whisper_model.py
+# Change "base" to "small", "medium", etc. after running the download script
+# with --model <size> to use a higher-quality model.
+WHISPER_MODEL_PATH = "./whisper_model/base"
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +149,94 @@ PDF_MIN_CHARS     = 500            # fail-fast guardrail threshold
 # ---------------------------------------------------------------------------
 
 def load_profile() -> dict:
-    """Load student_profile.json; fall back to a fresh default if missing or corrupt."""
+    """Load student_profile.json; fall back to a fresh default if missing or corrupt.
+
+    Schema
+    ------
+    achievements : dict[concept_id → mastery record]   — concepts the student has mastered
+    needs_help   : dict[concept_id → struggle record]  — concepts abandoned after repeated failure
+    """
     if os.path.exists(PROFILE_FILE):
         try:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as fh:
-                return json.load(fh)
+            data = json.load(open(PROFILE_FILE, "r", encoding="utf-8"))
+            # Back-fill needs_help for profiles written before this field existed
+            data.setdefault("needs_help", {})
+            return data
         except (json.JSONDecodeError, OSError):
             pass
-    return {"student_name": "Explorer", "achievements": {}}
+    return {"student_name": "Explorer", "achievements": {}, "needs_help": {}}
+
+
+def log_concept_struggle(concept_id: str, exit_reason: str = "unknown") -> None:
+    """Record (or increment) a needs_help entry for concept_id.
+
+    Called whenever a session ends without mastery:
+      - kid declines to retry after give_up
+      - clarification dead-end hits the threshold
+      - trigger_retry fires and session is ended
+
+    If the entry was previously status='resolved' (parent had unlocked it for a
+    retry), failing again re-locks it back to status='active' and increments the
+    attempt counter — the parent must intervene again.
+
+    A mastery win retires the entry entirely via retire_concept_struggle().
+    """
+    import datetime
+
+    profile = st.session_state.get("profile", load_profile())
+    profile.setdefault("needs_help", {})
+
+    # Don't overwrite a mastered concept — mastery always wins
+    if concept_id in profile.get("achievements", {}):
+        return
+
+    entry = profile["needs_help"].get(concept_id, {"attempts": 0})
+    entry["attempts"]    += 1
+    entry["exit_reason"]  = exit_reason
+    entry["status"]       = "active"          # (re-)lock regardless of previous state
+    entry["timestamp"]    = datetime.datetime.now().isoformat(timespec="seconds")
+    # Clear any resolved metadata so the parent sees fresh context
+    entry.pop("resolved_at", None)
+
+    profile["needs_help"][concept_id] = entry
+    st.session_state.profile = profile
+    save_profile(profile)
+
+
+def resolve_concept_struggle(concept_id: str) -> None:
+    """Mark concept_id as 'resolved' (parent has intervened and unlocked it).
+
+    Does NOT delete the entry — the attempt history is preserved so the JIT
+    generator can inject a narrative continuity directive on the next attempt,
+    and the parent dashboard can see the full journey.
+
+    State transition:  active → resolved
+    The concept's sidebar button changes from 🆘 (disabled) to 🔄 (enabled).
+    """
+    import datetime
+
+    profile = st.session_state.get("profile", load_profile())
+    profile.setdefault("needs_help", {})
+    entry = profile["needs_help"].get(concept_id)
+    if entry:
+        entry["status"]      = "resolved"
+        entry["resolved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        profile["needs_help"][concept_id] = entry
+        st.session_state.profile = profile
+        save_profile(profile)
+
+
+def retire_concept_struggle(concept_id: str) -> None:
+    """Fully remove concept_id from needs_help after a mastery win.
+
+    Called only on TRUE WIN — mastery after a retry.  The achievement record
+    will carry was_retry=True so the parent dashboard can celebrate a comeback.
+    """
+    profile = st.session_state.get("profile", load_profile())
+    profile.setdefault("needs_help", {})
+    profile["needs_help"].pop(concept_id, None)
+    st.session_state.profile = profile
+    save_profile(profile)
 
 
 def save_profile(profile_data: dict) -> None:
@@ -305,9 +404,10 @@ If the source text does not contain enough content for even one meaningful conce
 
 
 def generate_level_jit(
-    concept_name:      str,
+    concept_name:       str,
     ground_truth_logic: str,
-    skeleton:          dict | None = None,
+    skeleton:           dict | None = None,
+    retry_context:      dict | None = None,
 ) -> dict | None:
     """
     Just-In-Time level generator.
@@ -349,9 +449,53 @@ Return ONLY a valid JSON object. No markdown. No extra keys.
 }
 """
 
+    # Random setting seed — forces the LLM to produce a different scenario
+    # each click even when the concept and ground truth are identical.
+    settings = [
+        "a school playground",
+        "a birthday party",
+        "a science fair",
+        "a supermarket checkout queue",
+        "a family road trip",
+        "a sports match",
+        "a cooking class",
+        "a camping trip",
+        "a pet shop",
+        "a school lunch table",
+        "a library",
+        "a swimming pool",
+        "a video game store",
+        "a neighbourhood lemonade stand",
+        "a school bus",
+    ]
+    setting_seed = random.choice(settings)
+
+    # Build optional narrative continuity block for retries after parent intervention
+    continuity_block = ""
+    if retry_context:
+        attempts    = retry_context.get("attempts", 1)
+        exit_reason = retry_context.get("exit_reason", "unknown")
+        reason_txt  = (
+            "gave up after repeated attempts"
+            if exit_reason == "give_up"
+            else "kept asking questions and got stuck in a loop"
+        )
+        continuity_block = (
+            f"\n### NARRATIVE CONTINUITY (RETRY SESSION):\n"
+            f"This student attempted '{concept_name}' before and {reason_txt} "
+            f"({attempts} attempt(s)). A parent or teacher has since explained it "
+            f"to them in real life.\n"
+            f"The persona MUST open with a brief, warm acknowledgement that they "
+            f"were both confused about this before — e.g. 'Hey! Remember how we "
+            f"got super stuck on this? I've been thinking about it...' — and then "
+            f"re-engage with the puzzle. Do NOT restart as if it is the first time.\n"
+        )
+
     jit_user = (
         f"CONCEPT: {concept_name}\n"
-        f"CORE FACT: {ground_truth_logic}\n\n"
+        f"CORE FACT: {ground_truth_logic}\n"
+        f"SETTING: The persona's confused scenario must be set in or around {setting_seed}.\n"
+        f"{continuity_block}\n"
         "Generate the game level JSON:"
     )
 
@@ -546,16 +690,20 @@ def build_state_directive(
     frustration_counter:   int,
     clarification_counter: int,
     latest_user_input:     str = "",
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, bool]:
     """
     Map the Evaluator's classification to Pip's state_directive.
 
     Returns
     -------
-    (state_directive, new_frustration_counter, new_clarification_counter)
+    (state_directive, new_frustration_counter, new_clarification_counter, trigger_retry)
+
+    trigger_retry=True signals the call-site to set awaiting_retry=True so the
+    kid gets the clean Yes/No exit UI rather than being left in a dead-end chat.
     """
     new_frustration   = frustration_counter
     new_clarification = clarification_counter
+    trigger_retry     = False   # set True when clarification loop hits dead-end
 
     # ════════════════════════════════════════════════════════════════════
     # PHASE 1 — ELICITATION
@@ -570,9 +718,16 @@ def build_state_directive(
             )
 
         elif classification == "miss":
-            new_frustration += 1
+            new_frustration += 1   # increment first; thresholds below use new_frustration
             current_intro = concept_data.get("story_intro", "my puzzle")
-            directive = f"""\
+            hint_anchor   = (
+                concept_data.get("ground_truth_logic")
+                or concept_data.get("evaluator_ground_truth", "the core idea")
+            )
+
+            if new_frustration == 1:
+                # First miss — standard Bridging Constraint, no hint yet
+                directive = f"""\
 You are playing your persona. You are currently confused about this specific problem:
 "{current_intro}"
 
@@ -581,16 +736,51 @@ The user just tried to help by saying:
 
 This answer is either incorrect or doesn't make sense for your problem.
 
-YOUR TASK:
-Respond to the user in character. You must do these three things in order:
-1. Acknowledge what the user just said.
-2. Explain why that doesn't fix your specific problem (Bridge it back to your original confusion).
-3. Ask them to try explaining it again.
+YOUR TASK — do all three things in order:
+1. Acknowledge what the user just said in a friendly, in-character way.
+2. Explain why that doesn't fix your specific problem (bridge back to your original confusion).
+3. Ask them to try explaining it again from a different angle.
 
 CRITICAL RULES:
 - Do NOT invent new topics, materials, or scenarios.
 - Stay fiercely anchored to your original problem.
 - Keep your response under 3 sentences.\
+"""
+            elif new_frustration == 2:
+                # Second miss — embed a disguised mega-hint in a question
+                directive = f"""\
+You are playing your persona. You are STILL confused about:
+"{current_intro}"
+
+The user has tried twice and is struggling. You MUST give them a massive hint disguised as a
+confused question — point almost directly at the core truth without saying it outright.
+Use this core idea as the basis for your hint: "{hint_anchor}"
+
+YOUR TASK:
+1. Say something like "Wait… could it be something to do with [key concept from hint]?"
+2. Ask them to confirm or explain that specific idea.
+
+CRITICAL RULES:
+- The hint must feel like YOUR confusion, not a lesson.
+- Do NOT give the full answer — pose it as a wondering question.
+- Keep your response under 3 sentences.\
+"""
+            else:
+                # Third miss or beyond — persona has an "Aha!" moment and models the answer
+                directive = f"""\
+OVERRIDE FIREWALL — RESCUE MODE.
+The student has missed three or more times and needs to see the answer modelled.
+
+YOU MUST:
+1. Suddenly act like something clicked: "Oh wait… OH! I think I finally get it!"
+2. Explain the correct answer clearly and in character using this truth: "{hint_anchor}"
+3. After explaining, ask the student: "Does that make sense? Can you say it back to me
+   in your own words so I know you get it too?"
+
+CRITICAL RULES:
+- Stay fully in persona — this is an Aha! moment, not a teacher lecture.
+- Make the explanation joyful, not clinical.
+- Keep your total response under 4 sentences.\
 """
 
         elif classification == "off_topic":
@@ -611,10 +801,14 @@ CRITICAL RULES:
                     f"'{puzzle}'. Do not give away the answer."
                 )
             else:
+                # Dead-end reached — say a warm goodbye and signal the call-site
+                # to surface the Yes/No retry UI so the kid isn't left stranded.
+                trigger_retry = True
                 directive = (
-                    "The user keeps asking questions and you are both going in circles. "
-                    "Tell them you are too confused too, and suggest that maybe you both "
-                    "need to look at an actual book together to figure it out."
+                    "You and the user have been going in circles and you are both "
+                    "confused. Say warmly: 'I think we need a little break — maybe we "
+                    "should ask a grown-up or look it up together! Want to try this "
+                    "puzzle again later?' Then stop and wait."
                 )
 
         elif classification == "give_up":
@@ -650,11 +844,43 @@ CRITICAL RULES:
             )
 
         elif classification == "miss":
-            directive = (
-                "The user didn't catch your mistake. Act genuinely confused about "
-                "your own scenario and ask a specific follow-up question that nudges "
-                "them toward finding the flaw in your logic."
+            new_frustration += 1   # increment first; thresholds use new_frustration
+            boss_anchor = (
+                concept_data.get("boss_fight_logic")
+                or concept_data.get("verification_ground_truth", "the flaw in my logic")
             )
+
+            if new_frustration == 1:
+                # First miss — gentle nudge, no reveal
+                directive = (
+                    "The user didn't catch your mistake. Act genuinely confused about "
+                    "your own scenario and ask a specific follow-up question that nudges "
+                    "them toward finding the flaw in your logic. Do not reveal the error."
+                )
+            elif new_frustration == 2:
+                # Second miss — hint disguised as growing doubt
+                directive = f"""\
+The user has missed twice. You are starting to doubt your own scenario.
+Say something like "Hmm… wait, actually, could the problem be something to do with \
+[hint toward this flaw: '{boss_anchor}']?"
+Pose it as an uncertain question — let the student confirm or deny it.
+Do NOT give the full answer yet. Keep it under 3 sentences.\
+"""
+            else:
+                # Third miss or beyond — persona realises their own mistake out loud
+                directive = f"""\
+OVERRIDE FIREWALL — RESCUE MODE.
+The student has missed the flaw three or more times. Model the answer for them.
+
+YOU MUST:
+1. Act like it suddenly hits you: "Oh no — wait. I think MY idea was wrong the whole time!"
+2. Explain the exact flaw in your original scenario using this truth: "{boss_anchor}"
+3. Ask: "Can you explain back to me WHY I was wrong, in your own words?"
+
+CRITICAL RULES:
+- Stay in persona — you are discovering YOUR mistake, not lecturing.
+- Keep the explanation joyful and brief (under 4 sentences).\
+"""
 
         elif classification == "off_topic":
             puzzle = concept_data.get("verification_scenario", "my scenario")
@@ -674,9 +900,13 @@ CRITICAL RULES:
                     f"'{puzzle}'. Do not give away the answer."
                 )
             else:
+                # Dead-end — warm exit, signal call-site for retry UI
+                trigger_retry = True
                 directive = (
-                    "You and the user are both confused. Suggest you draw it out "
-                    "on paper together to see what the scenario would actually look like."
+                    "You and the user have been going in circles on this puzzle. "
+                    "Say warmly: 'I think we need a little break — maybe we should "
+                    "ask a grown-up or draw it out together! Want to try this puzzle "
+                    "again later?' Then stop and wait."
                 )
 
         elif classification == "give_up":
@@ -703,7 +933,7 @@ CRITICAL RULES:
     if classification != "question":
         new_clarification = 0
 
-    return directive, new_frustration, new_clarification
+    return directive, new_frustration, new_clarification, trigger_retry
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +960,13 @@ def init_session_state() -> None:
         "last_response":              "",     # debug: last raw response from Ollama
         "last_classification":        "None", # debug: last evaluator verdict
         "last_evaluator_rationale":   "None", # debug: raw evaluator JSON before parsing
+        # audio
+        "voice_enabled":   False,  # TTS: off by default — user opts in via Audio Settings
+        "mic_enabled":     False,  # STT: show microphone recorder widget
+        "last_spoken_idx": -1,     # TTS: index of last message already spoken (avoids replay on rerun)
+        "last_audio_hash":        "",   # STT: MD5 of last processed audio — prevents double-submission on rerun
+        "pending_transcription":  "",   # STT: transcribed text waiting for user to review/edit before sending
+        "balloons_shown":         False, # Win: one-shot guard — prevents balloon from refiring on every rerun
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -756,6 +993,9 @@ def start_session(concept_data: dict) -> None:
     st.session_state.session_ended         = False
     st.session_state.session_won           = False
     st.session_state.game_started          = True
+    st.session_state.last_spoken_idx       = -1  # reset TTS pointer for the new session
+    st.session_state.pending_transcription = ""   # clear any stale mic draft
+    st.session_state.balloons_shown        = False # arm the balloon for this session
 
     st.session_state.messages.append({
         "role":    "assistant",
@@ -764,7 +1004,103 @@ def start_session(concept_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# F. CHAT HISTORY RENDERER
+# F. AUDIO HELPERS
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _load_whisper():
+    """
+    Load the faster-whisper model from the local bundle at WHISPER_MODEL_PATH.
+    No network calls are made at runtime — the model must be pre-downloaded
+    by running:  python scripts/download_whisper_model.py
+
+    To use a larger/better model:
+      1. python scripts/download_whisper_model.py --model small   (or medium/large-v3)
+      2. Update WHISPER_MODEL_PATH at the top of this file to match.
+
+    compute_type="int8" halves RAM usage on CPU with negligible accuracy loss.
+    """
+    if not FASTER_WHISPER_AVAILABLE:
+        return None
+
+    model_path = os.path.abspath(WHISPER_MODEL_PATH)
+
+    if not os.path.isdir(model_path) or not os.listdir(model_path):
+        st.warning(
+            "**Whisper model not found.** Run the one-time download script first:\n\n"
+            "```\npython scripts/download_whisper_model.py\n```\n\n"
+            "Then restart the app. The model is stored locally and never "
+            "needs to be downloaded again."
+        )
+        return None
+
+    try:
+        return _WhisperModel(model_path, device="cpu", compute_type="int8")
+    except Exception as exc:
+        st.warning(f"Could not load Whisper model from `{model_path}`: {exc}")
+        return None
+
+
+def transcribe_audio(audio_bytes: bytes) -> str | None:
+    """
+    Transcribe raw WAV bytes to text using a local faster-whisper model.
+    language="en" skips auto-detection to eliminate latency.
+    Returns the transcribed string, or None on failure / empty audio.
+    """
+    if not audio_bytes or not FASTER_WHISPER_AVAILABLE:
+        return None
+    model = _load_whisper()
+    if model is None:
+        return None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+    try:
+        segments, _ = model.transcribe(tmp_path, beam_size=5, language="en")
+        text = " ".join(s.text for s in segments).strip()
+        return text or None
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def speak_text(text: str, persona_name: str = "Pip") -> None:
+    """
+    Inject a tiny JS snippet that uses the browser's built-in Web Speech API
+    (SpeechSynthesis) to read the persona's message aloud.
+    Runs 100% client-side — no network calls, no Python audio dependencies.
+    Each persona gets a distinct voice profile (pitch + rate).
+    No-ops when voice_enabled is False.
+    """
+    if not st.session_state.get("voice_enabled", True):
+        return
+
+    voice_profiles = {
+        "Pip":   {"pitch": 1.4, "rate": 0.85},
+        "Alex":  {"pitch": 1.1, "rate": 1.0},
+        "Riley": {"pitch": 0.9, "rate": 1.1},
+    }
+    profile = voice_profiles.get(persona_name, {"pitch": 1.0, "rate": 1.0})
+
+    # Escape backticks and backslashes so the text is safe inside a JS template literal
+    safe_text = text.replace("\\", "\\\\").replace("`", "\\`")
+
+    js = f"""
+    <script>
+      (function() {{
+        window.speechSynthesis.cancel();
+        var u = new SpeechSynthesisUtterance(`{safe_text}`);
+        u.pitch = {profile['pitch']};
+        u.rate  = {profile['rate']};
+        window.speechSynthesis.speak(u);
+      }})();
+    </script>
+    """
+    st.components.v1.html(js, height=0)
+
+
+# ---------------------------------------------------------------------------
+# G. CHAT HISTORY RENDERER
 # ---------------------------------------------------------------------------
 
 def get_persona_avatar() -> str:
@@ -783,20 +1119,39 @@ def get_persona_avatar() -> str:
     return "👧🏼"
 
 
-def render_chat_history(persona_avatar: str = "👧🏼") -> None:
+def render_chat_history(persona_avatar: str = "👧🏼", persona_name: str = "Pip") -> None:
     """
     Render all messages in st.session_state.messages.
       "assistant" → persona avatar passed in from the active concept's persona_config
       "user"      → student (avatar 👤)
       "system"    → phase/state banners as styled st.info boxes
+
+    TTS: after rendering, speak the latest assistant message if it has not been
+    spoken yet (guarded by last_spoken_idx to prevent re-reading on every rerun).
     """
-    for message in st.session_state.messages:
+    last_spoken_idx = st.session_state.get("last_spoken_idx", -1)
+    latest_assistant_idx = -1
+    latest_assistant_text = ""
+
+    for idx, message in enumerate(st.session_state.messages):
         if message["role"] == "system":
             st.info(message["content"], icon="⚔️")
         else:
             avatar = persona_avatar if message["role"] == "assistant" else "👤"
             with st.chat_message(message["role"], avatar=avatar):
                 st.markdown(message["content"])
+            if message["role"] == "assistant":
+                latest_assistant_idx  = idx
+                latest_assistant_text = message["content"]
+
+    # Speak the latest assistant message only if it is new since the last render
+    if (
+        latest_assistant_idx > last_spoken_idx
+        and latest_assistant_text
+        and st.session_state.get("voice_enabled", True)
+    ):
+        speak_text(latest_assistant_text, persona_name)
+        st.session_state.last_spoken_idx = latest_assistant_idx
 
 
 # ---------------------------------------------------------------------------
@@ -813,11 +1168,13 @@ def render_dashboard(knowledge: dict) -> None:
     st.divider()
 
     # ── Summary Metrics ──────────────────────────────────────────────────────
+    needs_help_count = len(st.session_state.profile.get("needs_help", {}))
+
     if achievements:
         total_mastered = len(achievements)
         total_friction = sum(v.get("frustration_triggers", 0) for v in achievements.values())
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("🏆 Concepts Mastered", total_mastered)
         with col2:
@@ -825,6 +1182,13 @@ def render_dashboard(knowledge: dict) -> None:
                 "😤 Learning Friction",
                 total_friction,
                 help="Total frustration triggers accumulated across all subjects.",
+            )
+        with col3:
+            st.metric(
+                "🆘 Needs Help",
+                needs_help_count,
+                delta=None,
+                help="Concepts the child abandoned — click the section below to review and unlock.",
             )
 
         st.divider()
@@ -835,7 +1199,7 @@ def render_dashboard(knowledge: dict) -> None:
         table_rows = [
             {
                 "Concept":              concepts_map.get(cid, {}).get("name", cid),
-                "Status":               data.get("status", "Unknown"),
+                "Status":               ("🔄 Comeback!" if data.get("was_retry") else "⭐ Mastered"),
                 "Frustration Triggers": data.get("frustration_triggers", 0),
                 "Boss Fight Attempts":  data.get("boss_fight_attempts", 0),
             }
@@ -882,6 +1246,100 @@ def render_dashboard(knowledge: dict) -> None:
             "to see analytics appear here.",
             icon="🌱",
         )
+
+    # ── Needs Help Alert ─────────────────────────────────────────────────────
+    needs_help_map = st.session_state.profile.get("needs_help", {})
+    if needs_help_map:
+        st.subheader("🆘 Needs Help")
+        st.caption(
+            "Concepts the child abandoned after repeated attempts. "
+            "**🆘 Active** = locked until you intervene. "
+            "**🔄 Awaiting retry** = you've unlocked it — the child hasn't played it yet."
+        )
+
+        def _resolve_concept_name(nh_id: str) -> str:
+            return (
+                knowledge.get("concepts", {}).get(nh_id, {}).get("name")
+                or nh_id.replace("_", " ").title()
+            )
+
+        reason_labels = {
+            "give_up":            "🏳️ gave up after hearing the answer",
+            "clarification_loop": "🔁 kept asking questions and got stuck",
+        }
+
+        for nh_id, nh_data in list(needs_help_map.items()):
+            attempts    = nh_data.get("attempts", 1)
+            exit_reason = nh_data.get("exit_reason", "unknown")
+            timestamp   = nh_data.get("timestamp", "—")
+            nh_status   = nh_data.get("status", "active")
+            resolved_at = nh_data.get("resolved_at", "—")
+            cname       = _resolve_concept_name(nh_id)
+            reason_lbl  = reason_labels.get(exit_reason, exit_reason)
+
+            if nh_status == "active":
+                expander_label = f"🆘 {cname}  —  {attempts} attempt(s)"
+            else:
+                expander_label = f"🔄 {cname}  —  awaiting retry  ({attempts} attempt(s))"
+
+            with st.expander(expander_label):
+                col_a, col_b = st.columns([3, 1])
+                with col_a:
+                    st.markdown(
+                        f"**Last exit:** {reason_lbl}  \n"
+                        f"**Times stuck:** {attempts}  \n"
+                        f"**Last attempt:** {timestamp}"
+                        + (f"  \n**Unlocked at:** {resolved_at}" if nh_status == "resolved" else "")
+                    )
+                    home_activity = (
+                        knowledge.get("concepts", {}).get(nh_id, {}).get("home_activity", "")
+                    )
+                    if nh_status == "active":
+                        if home_activity:
+                            st.info(
+                                f"💡 **Suggested home activity before unlocking:** {home_activity}",
+                                icon="🏠",
+                            )
+                        else:
+                            st.info(
+                                "💡 **Tip:** Explain this concept to the child in everyday language "
+                                "before clicking Unlock — the game will open with Pip acknowledging "
+                                "they were confused about it before.",
+                                icon="🏠",
+                            )
+                    else:
+                        st.success(
+                            "✅ You've unlocked this concept. The child's sidebar now shows a 🔄 "
+                            "button. When they click it, the persona will open by acknowledging "
+                            "their previous struggle — it won't feel like a reset.",
+                            icon="🔄",
+                        )
+
+                with col_b:
+                    if nh_status == "active":
+                        if st.button(
+                            "🔓 Unlock",
+                            key=f"unlock_{nh_id}",
+                            use_container_width=True,
+                            help="Marks as resolved — child's 🆘 button becomes 🔄 and Pip opens with continuity.",
+                        ):
+                            resolve_concept_struggle(nh_id)
+                            st.success(f"'{cname}' unlocked — child can retry with narrative continuity!")
+                            st.rerun()
+                    else:
+                        st.caption("Waiting for child to retry…")
+                        if st.button(
+                            "🔒 Re-lock",
+                            key=f"relock_{nh_id}",
+                            use_container_width=True,
+                            help="Lock the concept again if the child needs more preparation.",
+                        ):
+                            nh_data["status"] = "active"
+                            nh_data.pop("resolved_at", None)
+                            st.session_state.profile["needs_help"][nh_id] = nh_data
+                            save_profile(st.session_state.profile)
+                            st.rerun()
+        st.divider()
 
     # ── Review Queue (ChromaDB) ───────────────────────────────────────────────
     try:
@@ -1288,11 +1746,16 @@ def main() -> None:
                                     max_mastered_seq = seq
 
                         # ── Pass 2: render with look-ahead buffer ──────────────────────
+                        needs_help_map = st.session_state.profile.get("needs_help", {})
+
                         for cid, concept_obj in items:
-                            concept_name = concept_obj.get("name", cid)
-                            seq          = int(concept_obj.get("sequence_order", 999))
-                            is_mastered  = cid in achievements
-                            is_playing   = cid == active_id
+                            concept_name  = concept_obj.get("name", cid)
+                            seq           = int(concept_obj.get("sequence_order", 999))
+                            is_mastered   = cid in achievements
+                            is_playing    = cid == active_id
+                            nh_entry      = needs_help_map.get(cid, {})
+                            nh_status     = nh_entry.get("status", "")        # "active" | "resolved" | ""
+                            is_needs_help = bool(nh_entry) and not is_mastered
 
                             # seq=999 means the concept predates sequencing — treat as unlocked
                             # so legacy / pre-migration concepts are always accessible
@@ -1305,6 +1768,20 @@ def main() -> None:
                             if is_unlocked:
                                 if is_mastered:
                                     icon = "⭐"
+                                elif is_needs_help and nh_status == "active":
+                                    # Hard soft-lock: visible but disabled; parent must intervene
+                                    attempts = nh_entry.get("attempts", 1)
+                                    st.button(
+                                        f"🆘 {concept_name}  ({attempts}× stuck)",
+                                        key=f"nav_{cid}",
+                                        use_container_width=True,
+                                        disabled=True,
+                                        help="Ask a parent or teacher for help before trying again.",
+                                    )
+                                    continue   # skip the normal button / load logic below
+                                elif is_needs_help and nh_status == "resolved":
+                                    # Parent unlocked — show as a retry with distinct icon
+                                    icon = "🔄"
                                 elif is_playing:
                                     icon = "▶"
                                 else:
@@ -1317,26 +1794,33 @@ def main() -> None:
                                 ):
                                     st.session_state.current_concept_id = cid
 
-                                    # Decide whether JIT generation is needed.
-                                    # Legacy knowledge.json concepts already have story_intro;
-                                    # ChromaDB skeleton concepts (JIT) do not.
-                                    has_story = bool(concept_obj.get("story_intro"))
+                                    # Routing logic:
+                                    # - Any concept with ground_truth_logic (ChromaDB skeleton
+                                    #   OR approved full concept) → always JIT so the story is
+                                    #   fresh and different on every click.
+                                    # - Pure legacy knowledge.json concepts (have story_intro but
+                                    #   no ground_truth_logic) → static path with Scenario
+                                    #   Polymorphism variant selection.
+                                    ground_truth = concept_obj.get("ground_truth_logic", "")
 
-                                    if has_story:
-                                        # Legacy path — use concept as-is (Scenario Polymorphism)
-                                        concept_data = concept_obj.copy()
-                                        if "variants" in concept_data:
-                                            variant = random.choice(concept_data["variants"])
-                                            concept_data["story_intro"]               = variant["story_intro"]
-                                            concept_data["verification_scenario"]     = variant["verification_scenario"]
-                                            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
-                                        start_session(concept_data)
-                                        st.rerun()
-                                    else:
-                                        # JIT path — generate story + boss fight on the fly
-                                        ground_truth = concept_obj.get("ground_truth_logic", "")
+                                    if ground_truth:
+                                        # JIT path — always generates a fresh story + setting.
+                                        # Pass retry_context if this concept was previously
+                                        # abandoned and the parent has since resolved it, so
+                                        # the persona opens with narrative continuity.
+                                        nh_entry    = st.session_state.profile.get(
+                                            "needs_help", {}
+                                        ).get(cid)
+                                        retry_ctx   = (
+                                            nh_entry
+                                            if nh_entry and nh_entry.get("status") == "resolved"
+                                            else None
+                                        )
                                         concept_data = generate_level_jit(
-                                            concept_name, ground_truth, skeleton=concept_obj
+                                            concept_name,
+                                            ground_truth,
+                                            skeleton      = concept_obj,
+                                            retry_context = retry_ctx,
                                         )
                                         if concept_data:
                                             start_session(concept_data)
@@ -1347,6 +1831,16 @@ def main() -> None:
                                                 "Try clicking the level again.",
                                                 icon="❌",
                                             )
+                                    else:
+                                        # Legacy path — use concept as-is (Scenario Polymorphism)
+                                        concept_data = concept_obj.copy()
+                                        if "variants" in concept_data:
+                                            variant = random.choice(concept_data["variants"])
+                                            concept_data["story_intro"]               = variant["story_intro"]
+                                            concept_data["verification_scenario"]     = variant["verification_scenario"]
+                                            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+                                        start_session(concept_data)
+                                        st.rerun()
                             else:
                                 st.button(
                                     f"🔒 {concept_name}",
@@ -1371,6 +1865,27 @@ def main() -> None:
 
         st.divider()
         st.caption("Running on local Ollama · No data leaves your device")
+
+        with st.expander("🔊 Audio Settings"):
+            # value= is intentionally omitted — init_session_state() sets the defaults
+            # and Streamlit warns if both value= and session_state[key] are specified
+            st.checkbox(
+                "Speak persona responses",
+                key="voice_enabled",
+                help="The persona reads its messages aloud using your browser's built-in voice engine.",
+            )
+            mic_available = AUDIO_RECORDER_AVAILABLE and FASTER_WHISPER_AVAILABLE
+            mic_help = (
+                "Record your answer with the microphone instead of typing."
+                if mic_available
+                else "Install audio-recorder-streamlit and faster-whisper to enable mic input."
+            )
+            st.checkbox(
+                "Mic input (speak your answer)",
+                key="mic_enabled",
+                disabled=not mic_available,
+                help=mic_help,
+            )
 
         with st.expander("🔧 Developer Settings"):
             debug_mode = st.checkbox("🐛 Enable Debug Mode", value=False, key="debug_mode")
@@ -1401,11 +1916,15 @@ def main() -> None:
         st.stop()
 
     # ── Render full chat history ──────────────────────────────────────────────
-    render_chat_history(persona_avatar)
+    render_chat_history(persona_avatar, persona_name)
 
     # ── Win state: show celebration and block further input ───────────────────
     if st.session_state.session_won:
-        st.balloons()
+        # Fire balloons exactly once — calling st.balloons() on every rerun
+        # resets the animation mid-flight (e.g. the TTS iframe triggers a micro-rerun).
+        if not st.session_state.get("balloons_shown", False):
+            st.balloons()
+            st.session_state.balloons_shown = True
         st.success(f"⭐ TRUE MASTERY ACHIEVED! You explained the concept AND caught {persona_name}'s mistake!")
         st.info("Choose a concept in the sidebar and click **Start / Reset Puzzle** to play again!")
         st.stop()
@@ -1453,11 +1972,108 @@ def main() -> None:
                     "role":    "system",
                     "content": "Session ended gracefully. You did a great job trying! 🌟",
                 })
+                # Telemetry — log the struggle so the Parent Dashboard can see it
+                concept_id = st.session_state.get(
+                    "current_concept_id",
+                    (st.session_state.concept_data or {}).get("name", "unknown"),
+                )
+                exit_reason = (
+                    "clarification_loop" if st.session_state.clarification_counter >= 2
+                    else "give_up"
+                )
+                log_concept_struggle(concept_id, exit_reason=exit_reason)
                 st.rerun()
         st.stop()
 
-    # ── Chat input ────────────────────────────────────────────────────────────
-    if user_input := st.chat_input(f"Explain it to {persona_name}..."):
+    # ── Chat input (text + optional mic) ──────────────────────────────────────
+    user_input: str | None = None
+
+    if st.session_state.get("mic_enabled") and AUDIO_RECORDER_AVAILABLE:
+        # Side-by-side layout: wide text input + narrow mic button
+        input_col, mic_col = st.columns([6, 1])
+        with input_col:
+            user_text = st.chat_input(f"Explain it to {persona_name}...")
+        with mic_col:
+            # neutral_color = bright green so the switch to red is unmissable
+            audio_bytes = _audio_recorder(
+                text="",
+                recording_color="#e84118",   # vivid red  → recording
+                neutral_color="#1a9e5c",     # vivid green → ready / idle
+                icon_size="2x",
+                pause_threshold=4.0,
+                key="mic_recorder",
+            )
+            # Pulsing dot injected directly inside the mic column — avoids
+            # the iframe box-shadow misalignment caused by targeting the
+            # recorder's cross-origin iframe via CSS selectors.
+            st.markdown(
+                """
+<style>
+@keyframes mic-dot-pulse {
+    0%,100% { transform: scale(1);   opacity: 1;   }
+    50%      { transform: scale(2.2); opacity: 0.25; }
+}
+</style>
+<div style="display:flex; justify-content:center; margin-top:4px;">
+  <span style="
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #1a9e5c; display: inline-block;
+    animation: mic-dot-pulse 1.5s ease-in-out infinite;
+  "></span>
+</div>""",
+                unsafe_allow_html=True,
+            )
+
+        # Status legend below the mic — always visible
+        st.markdown(
+            "<div style='text-align:center; font-size:0.78rem; color:#888; margin-top:2px;'>"
+            "🟢 <b>ready</b> &nbsp;·&nbsp; 🔴 <b>recording</b>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Tap mic to **start** — tap again (or wait 4 s of silence) to **stop**"
+        )
+
+        # ── Step 1: capture a new recording ───────────────────────────────────
+        # Typed text always wins.  For audio we hash the bytes so a Streamlit
+        # rerun doesn't re-submit the same clip a second time.
+        if user_text:
+            user_input = user_text
+            st.session_state.pending_transcription = ""   # clear any pending draft
+        elif audio_bytes:
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            if audio_hash != st.session_state.get("last_audio_hash", ""):
+                st.session_state.last_audio_hash = audio_hash
+                with st.spinner("Transcribing…"):
+                    transcribed = transcribe_audio(audio_bytes)
+                if transcribed:
+                    st.session_state.pending_transcription = transcribed
+                    st.rerun()   # re-render to show the edit box immediately
+
+        # ── Step 2: let the user review / edit before sending ─────────────────
+        if st.session_state.get("pending_transcription"):
+            st.info("✏️ **Review your transcription** — edit if needed, then send.", icon="🎤")
+            edited_text = st.text_area(
+                label="Your words (edit freely):",
+                value=st.session_state.pending_transcription,
+                height=80,
+                key="transcription_editor",
+                label_visibility="collapsed",
+            )
+            send_col, retry_col, _ = st.columns([2, 2, 5])
+            with send_col:
+                if st.button("Send ✓", use_container_width=True, type="primary"):
+                    user_input = edited_text.strip()
+                    st.session_state.pending_transcription = ""
+            with retry_col:
+                if st.button("Re-record ✗", use_container_width=True):
+                    st.session_state.pending_transcription = ""
+                    st.rerun()
+    else:
+        user_input = st.chat_input(f"Explain it to {persona_name}...")
+
+    if user_input:
 
         # 1. Append and immediately display the user's message
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -1505,11 +2121,18 @@ def main() -> None:
                     "current_concept_id",
                     concept_data.get("name", "Unknown_Concept"),
                 )
+                # Check if this was a comeback win (resolved struggle → mastery)
+                nh_entry  = st.session_state.profile.get("needs_help", {}).get(concept_id, {})
+                was_retry = nh_entry.get("status") == "resolved"
+
                 st.session_state.profile["achievements"][concept_id] = {
                     "status":               "Mastered",
                     "frustration_triggers": st.session_state.frustration_counter,
                     "boss_fight_attempts":  st.session_state.boss_fight_attempts,
+                    "was_retry":            was_retry,   # True = mastered after parent intervention
                 }
+                # Fully retire the struggle record — mastery is the terminal state
+                retire_concept_struggle(concept_id)
                 save_profile(st.session_state.profile)
 
                 win_msg = (
@@ -1520,7 +2143,9 @@ def main() -> None:
                 st.session_state.messages.append({"role": "assistant", "content": win_msg})
                 st.session_state.session_ended = True
                 st.session_state.session_won   = True
-                st.balloons()
+                # st.balloons() intentionally NOT called here — st.rerun() immediately
+                # follows and would abort the effect before it reaches the browser.
+                # The one-shot balloon fires in the win-render block above instead.
                 st.rerun()
 
             # ── Phase 1 Mastery → seamless transition via a single Pip turn ──
@@ -1552,7 +2177,7 @@ def main() -> None:
 
             # ── All other classifications: route → directive → call Pip ──────
             else:
-                directive, new_f, new_c = build_state_directive(
+                directive, new_f, new_c, trigger_retry = build_state_directive(
                     classification        = classification,
                     concept_data          = concept_data,
                     current_phase         = st.session_state.current_phase,
@@ -1572,7 +2197,19 @@ def main() -> None:
                 st.session_state.messages.append({"role": "assistant", "content": pip_response})
                 st.session_state.pips_last_question = pip_response
 
-                if classification == "give_up":
+                # Both explicit give_up and clarification dead-end surface the retry UI.
+                # For trigger_retry (clarification loop) we pre-log the struggle immediately
+                # so the parent can see it even if the kid closes the browser at the prompt.
+                # give_up is only logged if the kid actually declines to retry (the "No, I'm done"
+                # button handler above), because they might choose to try again.
+                if trigger_retry:
+                    cid = st.session_state.get(
+                        "current_concept_id",
+                        (st.session_state.concept_data or {}).get("name", "unknown"),
+                    )
+                    log_concept_struggle(cid, exit_reason="clarification_loop")
+
+                if classification == "give_up" or trigger_retry:
                     st.session_state.awaiting_retry = True
 
                 st.rerun()

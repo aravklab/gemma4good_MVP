@@ -142,7 +142,54 @@ Unlike `chroma_db/`, the DLQ log is valuable institutional memory (rejected conc
 
 ---
 
-## 9. Things We Would Do Differently
+## 9. Behavioural State Machines in Educational Apps
+
+### 9.1 Tracking without acting is useless telemetry
+`frustration_counter` was incremented on every miss from day one, but the LLM received the same directive regardless of whether it was miss #1 or miss #10. The counter was measuring but never changing behaviour. The fix — branching on post-increment thresholds inside `build_state_directive()` — is simple, but the lesson is: any metric you track should eventually influence something, or it's just noise.
+
+### 9.2 Post-increment vs pre-increment matters for threshold logic
+When `new_frustration += 1` runs first and thresholds are checked on `new_frustration`, tier 1 fires at 1, tier 2 at 2, tier 3 at ≥ 3. If you check `frustration_counter` before incrementing, every tier fires one attempt too early. This is a subtle off-by-one that looks correct in isolation but produces confusing UX.
+
+### 9.3 Dead-end states that don't exit are silent bugs
+The clarification counter had a threshold ("let's look at a book together") that produced a message but no exit path. The chat input remained open and the AI would repeat the same message indefinitely. Any escalation path that changes a persona's dialogue MUST be paired with an exit path — a retry prompt, a session-end flag, or a return to the concept selector.
+
+### 9.4 Returning a fourth boolean from routing functions is cleaner than side effects
+`build_state_directive()` originally returned `(directive, new_frustration, new_clarification)`. Adding a `trigger_retry` boolean as the fourth return value let the call-site react to the dead-end without `build_state_directive()` needing to know about Streamlit session state. The function stays pure (Python logic only); all UI effects happen at the call-site.
+
+### 9.5 Hard-delete on unlock loses pedagogically valuable history
+When a parent clicks "Unlock" on a concept the child abandoned, deleting the struggle record gives the AI total amnesia. The persona opens as if the previous session never happened, which breaks narrative immersion. The solution: a three-state status field (`active` / `resolved` / deleted-on-mastery) that preserves attempt history and allows the JIT prompt to inject a Narrative Continuity Directive on the retry session.
+
+### 9.6 "Comeback" wins deserve their own achievement badge
+`was_retry: True` in the achievements record lets the Parent Dashboard distinguish a first-attempt mastery from a mastery achieved after parent intervention and multiple failures. This is motivationally important — it should be celebrated differently, not silently merged with first-attempt wins.
+
+---
+
+## 10. Audio Integration
+
+### 10.1 `huggingface_hub` is incompatible with corporate SSL-inspection proxies
+`faster-whisper`'s default download path uses `huggingface_hub.snapshot_download()`, which internally uses `hf-xet` (a Rust-based transfer utility). Corporate proxies that perform SSL inspection replace certificates, causing `CERTIFICATE_VERIFY_FAILED`. Setting `REQUESTS_CA_BUNDLE=""` or `huggingface_hub.configure_http_backend` didn't help because `hf-xet` bypasses Python's HTTP stack entirely. The only reliable fix: bypass `huggingface_hub` completely and download model files directly with Python's `urllib.request` and `ssl._create_unverified_context`.
+
+### 10.2 `faster-whisper` expects `vocabulary.txt`, not `vocabulary.json`
+The vocabulary file required by `faster-whisper` is named `vocabulary.txt`. The initial download script listed `vocabulary.json`, which silently 404'd (the script treated 404 as an optional file). The model loaded but failed with "Cannot load the vocabulary from the model directory". Always verify exact filenames against the model repository before writing a custom download script.
+
+### 10.3 `@st.cache_resource` caches `None` from failed loads
+If `_load_whisper()` fails and returns `None`, `@st.cache_resource` caches that `None`. Subsequent calls return `None` without re-attempting the load — even after the underlying problem (missing files) is fixed. A full Streamlit server restart is required to clear the cache. Add a defensive `if model is None: return None` check and document this behaviour clearly.
+
+### 10.4 `audio_recorder_streamlit` holds audio bytes across reruns
+The widget retains the last recorded audio bytes in its component state across Streamlit reruns. Without a deduplication guard, every rerun (including the rerun triggered by `st.rerun()` after displaying the transcription) re-submits the same audio clip. Fix: compute `hashlib.md5(audio_bytes).hexdigest()` and compare against `st.session_state.last_audio_hash`. Only process the clip if the hash is new.
+
+### 10.5 Never call `st.balloons()` immediately before `st.rerun()`
+`st.rerun()` aborts the current script execution immediately. Any `st.balloons()` call before it is discarded before reaching the browser. The correct pattern: set a `balloons_shown` flag in session state, check it in the win-render block (after `render_chat_history()` completes), fire once, and set the flag. This also prevents the balloon from re-firing on every subsequent micro-rerun.
+
+### 10.6 CSS `box-shadow` on cross-origin iframes produces misaligned animations
+Applying a `box-shadow` animation to an `audio_recorder_streamlit` iframe via a CSS selector targets the full iframe element, which is wider than the circular button inside it. The shadow renders as an elongated oval, not a ring. Since the component is cross-origin, JavaScript cannot inspect or style its internals. The fix: inject a separate animated HTML element (`<span>` with CSS keyframes) directly inside the mic column via `st.markdown(unsafe_allow_html=True)`. This is entirely self-contained and layout-safe.
+
+### 10.7 Transcription staging improves accuracy and reduces frustration
+Dispatching transcribed text directly into the AI pipeline (common pattern) means mis-heard words go straight to the LLM without any chance to correct them. Staging the transcription in `pending_transcription` and showing an editable `st.text_area` with "Send ✓" / "Re-record ✗" buttons adds one interaction step but dramatically reduces frustration from Whisper errors on accents, background noise, or technical vocabulary.
+
+---
+
+## 11. Things We Would Do Differently
 
 - **Start with ChromaDB from day one.** Migrating from `knowledge.json` to ChromaDB mid-project required rewriting both the ingestion pipeline and the review queue UI. Designing around a vector store from the start would have been cleaner.
 - **Design the review queue before the ingestion pipeline.** The first version of `ingest.py` wrote directly to disk with no review step. Retroactively adding a `pending` gate required refactoring both ends.
