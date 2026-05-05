@@ -122,6 +122,7 @@ def _embed_and_upsert_concept(concept: dict, status: str = "pending") -> bool:
         "concept_name":     concept_name,
         "complexity_level": persona.get("complexity_level", ""),
         "persona_name":     persona.get("name", ""),
+        "subject":          concept.get("subject", "General"),
         "status":           status,
     }
     collection = get_chroma_collection()
@@ -744,8 +745,10 @@ def render_dashboard(knowledge: dict) -> None:
                 f"  ·  {meta['persona_name']} ({meta['complexity_level']})"
                 if meta.get("persona_name") else ""
             )
+            subject_tag  = meta.get("subject") or concept.get("subject", "General")
 
             with st.expander(f"📖 {concept_name}{persona_tag}", expanded=True):
+                st.write(f"**Subject:** `{subject_tag}`")
                 st.markdown(f"**Opening Puzzle:**\n> {concept.get('story_intro', '—')}")
                 st.markdown(f"**Boss Fight Scenario:**\n> {concept.get('verification_scenario', '—')}")
                 if concept.get("home_activity"):
@@ -805,6 +808,12 @@ def render_dashboard(knowledge: dict) -> None:
     Scanned documents or complex image-heavy layouts may result in lower-quality logic traps.
     """, icon="📄")
 
+    selected_subject = st.selectbox(
+        "Assign Subject",
+        ["General", "Mathematics", "Science", "Biology", "Finance", "Reading", "History", "Technology"],
+        help="This tag will be stored with every concept extracted from the PDF.",
+    )
+
     uploaded_file = st.file_uploader(
         "Choose a PDF file",
         type=["pdf"],
@@ -855,6 +864,7 @@ def render_dashboard(knowledge: dict) -> None:
             for concept in concepts_to_embed:
                 concept.setdefault("concept_name", concept.get("name", "Untitled Concept"))
                 concept.setdefault("name", concept["concept_name"])
+                concept["subject"] = selected_subject  # stamp subject chosen by parent
                 with st.spinner(f"Embedding **'{concept['concept_name']}'**…"):
                     ok = _embed_and_upsert_concept(concept, status="pending")
                 if ok:

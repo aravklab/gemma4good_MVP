@@ -17,6 +17,7 @@ Options:
     --collection NAME    ChromaDB collection name (default: curriculum).
     --max-chars N        Max characters per chunk (default: 3000).
     --chunk-limit N      Process at most N chunks (default: all).
+    --subject NAME       Subject category tag (default: General).
 
 Examples:
     python ingest.py textbook_chapter.pdf --dry-run
@@ -347,6 +348,7 @@ def _flatten_metadata(concept: dict) -> dict:
         "concept_name":     concept.get("name", ""),
         "complexity_level": persona.get("complexity_level", ""),
         "persona_name":     persona.get("name", ""),
+        "subject":          concept.get("subject", "General"),
         "status":           "pending",
     }
 
@@ -398,6 +400,7 @@ def run(
     overlap:         int,
     chunk_limit:     int | None,
     dry_run:         bool,
+    subject:         str = "General",
 ) -> None:
     print("=" * 60)
     print("GemmaGenius — PDF Ingestion Pipeline (ChromaDB)")
@@ -437,6 +440,9 @@ def run(
             continue
 
         for concept in concepts:
+            # Stamp the subject tag before embedding / dry-run output
+            concept["subject"] = subject
+
             if dry_run:
                 print(f"\n--- DRY RUN OUTPUT (chunk {i}) ---")
                 print(json.dumps(concept, indent=2, ensure_ascii=False))
@@ -490,6 +496,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"Overlap characters carried into each new chunk (default: {DEFAULT_OVERLAP}).")
     p.add_argument("--chunk-limit",   type=int, default=None,
                    help="Process at most N chunks (default: all).")
+    p.add_argument("--subject",       type=str, default="General",
+                   help="Subject category for the curriculum (e.g., Math, Science, Finance). "
+                        "Default: General.")
     return p
 
 
@@ -505,4 +514,5 @@ if __name__ == "__main__":
         overlap         = args.overlap,
         chunk_limit     = args.chunk_limit,
         dry_run         = args.dry_run,
+        subject         = args.subject,
     )
