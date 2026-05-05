@@ -793,21 +793,38 @@ def _load_whisper():
     even if the model has not been downloaded yet.
     compute_type="int8" halves RAM usage on CPU with negligible accuracy loss.
 
-    Corporate SSL note: setting CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE to empty
-    bypasses SSL bundle verification for the one-time HuggingFace model download.
-    This is needed on networks that use an SSL-inspection proxy (e.g. Cisco).
-    It does NOT affect Ollama calls or any other part of the app.
+    Corporate SSL note: huggingface_hub uses httpx internally, which does NOT
+    respect the REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE env variables.
+    We use huggingface_hub.configure_http_backend() to inject an httpx.Client
+    with verify=False so the one-time model download works behind SSL-inspection
+    proxies (common on corporate Cisco networks).
+    This override is scoped to huggingface_hub only and does not affect Ollama.
     """
     if not FASTER_WHISPER_AVAILABLE:
         return None
-    os.environ["CURL_CA_BUNDLE"]     = ""
-    os.environ["REQUESTS_CA_BUNDLE"] = ""
+    try:
+        import httpx
+        import huggingface_hub
+        # Inject an SSL-verification-disabled httpx client for the model download
+        huggingface_hub.configure_http_backend(
+            backend_factory=lambda: httpx.Client(verify=False)
+        )
+    except (ImportError, AttributeError):
+        # Older huggingface_hub (<0.23) — fall back to env-var approach
+        os.environ["CURL_CA_BUNDLE"]     = ""
+        os.environ["REQUESTS_CA_BUNDLE"] = ""
+
     try:
         return _WhisperModel("base", device="cpu", compute_type="int8")
     except Exception as exc:
         st.warning(
             f"Could not load Whisper model: {exc}\n\n"
-            "Try running `pip install faster-whisper` and restarting the app."
+            "The model download failed. This is usually a corporate SSL proxy issue. "
+            "If the problem persists, run this once in a terminal to pre-download the model:\n\n"
+            "```\npython -c \"import ssl; ssl._create_default_https_context = "
+            "ssl._create_unverified_context; "
+            "from huggingface_hub import snapshot_download; "
+            "snapshot_download('Systran/faster-whisper-base')\"\n```"
         )
         return None
 
