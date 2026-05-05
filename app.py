@@ -792,10 +792,24 @@ def _load_whisper():
     the Streamlit server process.  Called lazily so the app starts instantly
     even if the model has not been downloaded yet.
     compute_type="int8" halves RAM usage on CPU with negligible accuracy loss.
+
+    Corporate SSL note: setting CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE to empty
+    bypasses SSL bundle verification for the one-time HuggingFace model download.
+    This is needed on networks that use an SSL-inspection proxy (e.g. Cisco).
+    It does NOT affect Ollama calls or any other part of the app.
     """
     if not FASTER_WHISPER_AVAILABLE:
         return None
-    return _WhisperModel("base", device="cpu", compute_type="int8")
+    os.environ["CURL_CA_BUNDLE"]     = ""
+    os.environ["REQUESTS_CA_BUNDLE"] = ""
+    try:
+        return _WhisperModel("base", device="cpu", compute_type="int8")
+    except Exception as exc:
+        st.warning(
+            f"Could not load Whisper model: {exc}\n\n"
+            "Try running `pip install faster-whisper` and restarting the app."
+        )
+        return None
 
 
 def transcribe_audio(audio_bytes: bytes) -> str | None:
