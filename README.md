@@ -19,7 +19,10 @@ ollama pull gemma4:e4b
 ollama pull nomic-embed-text
 ollama serve        # keep this running in a separate terminal
 
-# 3. Launch the web app
+# 3. (Optional) Download the local Whisper model for voice input
+python scripts/download_whisper_model.py
+
+# 4. Launch the web app
 streamlit run app.py
 ```
 
@@ -141,7 +144,8 @@ Parent approves in Dashboard          │  boss_fight_logic
 
 **Why JIT?**
 - Ingestion is fast — no story generation overhead per chunk
-- Every session is unique — the same concept generates a new story each click
+- Every click generates a fresh story — a random real-world setting is injected into the prompt (playground, birthday party, science fair, camping trip, etc.) so the LLM cannot repeat itself
+- Only pure legacy `knowledge.json` concepts (no `ground_truth_logic`) use a static pre-written story
 - Reduces LLM context pressure during ingestion, improving skeleton quality
 
 ---
@@ -157,6 +161,10 @@ Gemma4good/
 ├── student_profile.json        # Persistent student achievements (auto-created on first win)
 ├── rejected_telemetry.jsonl    # Dead Letter Queue — append-only rejected concept log
 ├── requirements.txt            # Direct Python dependencies (pinned)
+├── scripts/
+│   └── download_whisper_model.py   # One-time Whisper model download (SSL-proxy safe)
+├── whisper_model/
+│   └── base/                   # Local Whisper model bundle (gitignored, ~145 MB)
 ├── chroma_db/                  # Local ChromaDB vector store (gitignored, auto-created)
 ├── LEARNINGS.md                # Architectural and technical lessons from building this
 └── README.md                   # This file
@@ -243,6 +251,39 @@ Toggle **🐛 Enable Debug Mode** in the sidebar. Reveals:
 - **🧠 Background Evaluator** — classification verdict and raw JSON
 - **👧🏼 Persona Generation** — full prompt sent and raw LLM output
 - **💾 Session State** — live JSON dump of all counters, phase, and concept data
+
+### Audio Settings (opt-in)
+
+Both audio features are **off by default** and enabled via the **Audio Settings** expander in the sidebar.
+
+| Feature | Default | How it works |
+|---|---|---|
+| Speak persona responses (TTS) | Off | Uses the browser's built-in Web Speech API (SpeechSynthesis). Zero install. Chrome/Edge only. Each persona has a distinct voice profile (pitch + rate). |
+| Mic input — speak your answer (STT) | Off | Records a WAV clip via `audio_recorder_streamlit`, transcribes locally with `faster-whisper` (base model, ~145 MB). No cloud call. |
+
+**Persona voice profiles:**
+
+| Persona | Pitch | Rate | Effect |
+|---|---|---|---|
+| Pip (8) | 1.4 | 0.85 | Higher, slower — child-like |
+| Alex (13) | 1.1 | 1.0 | Neutral teen voice |
+| Riley (16) | 0.9 | 1.1 | Lower, faster — detective energy |
+
+**Mic usage:** Click the mic button → speak → click again to stop (or pause for 4 seconds to auto-stop). The transcribed text appears in a confirmation box before being submitted. Typed input always takes priority over mic input if both are present.
+
+**One-time Whisper model setup (required for mic input):**
+
+```powershell
+python scripts/download_whisper_model.py
+```
+
+Downloads ~145 MB to `./whisper_model/base/` using plain HTTP (no `huggingface_hub` dependency at runtime, SSL-proxy safe). To upgrade the model quality:
+
+```powershell
+python scripts/download_whisper_model.py --model small   # 460 MB, better accuracy
+```
+
+Then update `WHISPER_MODEL_PATH = "./whisper_model/small"` at the top of `app.py`.
 
 ---
 
@@ -390,6 +431,14 @@ ollama serve
 cd "C:\Projects with Agents\Gemma4good"
 streamlit run app.py
 ```
+
+### Enable Mic Input (optional, one-time)
+
+```powershell
+python scripts/download_whisper_model.py
+```
+
+Downloads the Whisper `base` model (~145 MB) to `./whisper_model/base/`. Works behind corporate SSL-inspection proxies. After downloading, enable **Mic input** in the **Audio Settings** sidebar expander.
 
 ### Run — CLI
 
