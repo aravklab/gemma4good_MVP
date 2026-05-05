@@ -44,12 +44,14 @@ ssl._create_default_https_context = ssl._create_unverified_context  # noqa: SLF0
 
 HF_BASE = "https://huggingface.co/Systran/faster-whisper-{model}/resolve/main/{file}"
 
-# Files required by faster-whisper for every model size
+# Files required by faster-whisper for every model size.
+# vocabulary.txt is the correct name (not vocabulary.json).
+# preprocessor_config.json is optional — silently skipped on 404.
 MODEL_FILES = [
     "config.json",
     "tokenizer.json",
-    "vocabulary.json",
-    "model.bin",        # main weights (~75 MB tiny / ~145 MB base / etc.)
+    "vocabulary.txt",
+    "model.bin",
     "preprocessor_config.json",
 ]
 
