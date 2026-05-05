@@ -18,6 +18,8 @@ Options:
     --max-chars N        Max characters per chunk (default: 3000).
     --chunk-limit N      Process at most N chunks (default: all).
     --subject NAME       Subject category tag (default: General).
+    --module N           Major module number for fractional sequencing (default: 1).
+                         Concepts are stored as module.1, module.2, etc.
 
 Examples:
     python ingest.py textbook_chapter.pdf --dry-run
@@ -349,7 +351,7 @@ def _flatten_metadata(concept: dict) -> dict:
         "complexity_level": persona.get("complexity_level", ""),
         "persona_name":     persona.get("name", ""),
         "subject":          concept.get("subject", "General"),
-        "sequence_order":   int(concept.get("sequence_order", 999)),
+        "sequence_order":   float(concept.get("sequence_order", 999)),
         "status":           "pending",
     }
 
@@ -402,6 +404,7 @@ def run(
     chunk_limit:     int | None,
     dry_run:         bool,
     subject:         str = "General",
+    module:          int = 1,
 ) -> None:
     print("=" * 60)
     print("GemmaGenius — PDF Ingestion Pipeline (ChromaDB)")
@@ -442,9 +445,9 @@ def run(
             continue
 
         for concept in concepts:
-            # Stamp subject and linear sequence order before embedding / dry-run output
+            # Stamp subject and fractional sequence order (module.concept) before embedding
             concept["subject"]        = subject
-            concept["sequence_order"] = current_sequence
+            concept["sequence_order"] = float(f"{module}.{current_sequence}")
 
             if dry_run:
                 print(f"\n--- DRY RUN OUTPUT (chunk {i}, sequence {current_sequence}) ---")
@@ -505,6 +508,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--subject",       type=str, default="General",
                    help="Subject category for the curriculum (e.g., Math, Science, Finance). "
                         "Default: General.")
+    p.add_argument("--module",        type=int, default=1,
+                   help="Major module number for this PDF (used in fractional sequencing). "
+                        "Concepts are sequenced as module.1, module.2, … Default: 1.")
     return p
 
 
@@ -521,4 +527,5 @@ if __name__ == "__main__":
         chunk_limit     = args.chunk_limit,
         dry_run         = args.dry_run,
         subject         = args.subject,
+        module          = args.module,
     )

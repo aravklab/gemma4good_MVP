@@ -123,7 +123,7 @@ def _embed_and_upsert_concept(concept: dict, status: str = "pending") -> bool:
         "complexity_level": persona.get("complexity_level", ""),
         "persona_name":     persona.get("name", ""),
         "subject":          concept.get("subject", "General"),
-        "sequence_order":   int(concept.get("sequence_order", 999)),
+        "sequence_order":   float(concept.get("sequence_order", 999)),
         "status":           status,
     }
     collection = get_chroma_collection()
@@ -809,6 +809,51 @@ def render_dashboard(knowledge: dict) -> None:
                         st.rerun()
 
         st.divider()
+
+    # ── Active Curriculum ─────────────────────────────────────────────────────
+    st.subheader("📋 Active Curriculum")
+    st.caption("All approved concepts currently in the game. Remove any that are outdated or incorrect.")
+    try:
+        _col = get_chroma_collection()
+        active_results = _col.get(
+            where   = {"status": "approved"},
+            include = ["metadatas"],
+        )
+        active_ids   = active_results.get("ids", [])
+        active_metas = active_results.get("metadatas", [])
+    except Exception as exc:
+        st.warning(f"⚠️ Could not load active curriculum: {exc}")
+        active_ids, active_metas = [], []
+
+    if active_ids:
+        # Sort by subject then sequence_order for a clean display
+        active_sorted = sorted(
+            zip(active_ids, active_metas),
+            key=lambda x: (x[1].get("subject", ""), float(x[1].get("sequence_order", 999))),
+        )
+        for item_id, meta in active_sorted:
+            seq          = meta.get("sequence_order", "—")
+            concept_name = meta.get("concept_name", item_id)
+            subject      = meta.get("subject", "General")
+            col1, col2   = st.columns([5, 1])
+            with col1:
+                st.write(f"**{seq}** · {concept_name} `{subject}`")
+            with col2:
+                if st.button("🗑️", key=f"del_{item_id}", help=f"Remove '{concept_name}'"):
+                    # Preserve the concept name in the student profile before deletion
+                    # so Trophy Room entries remain human-readable
+                    profile = st.session_state.profile
+                    for ach_id, ach_data in profile.get("achievements", {}).items():
+                        if ach_id == item_id and "concept_name" not in ach_data:
+                            ach_data["concept_name"] = concept_name
+                    save_profile(profile)
+                    _col.delete(ids=[item_id])
+                    st.toast(f"'{concept_name}' removed from active curriculum.")
+                    st.rerun()
+    else:
+        st.info("No approved concepts yet. Approve concepts from the Review Queue above.", icon="📭")
+
+    st.divider()
 
     # ── Sequence Repair ───────────────────────────────────────────────────────
     with st.expander("🔧 Repair Sequence Numbers", expanded=False):
