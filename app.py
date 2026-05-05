@@ -216,6 +216,82 @@ If the source text does not contain enough content for even one meaningful conce
     return system_prompt, user_prompt
 
 
+def generate_level_jit(
+    concept_name:      str,
+    ground_truth_logic: str,
+    skeleton:          dict | None = None,
+) -> dict | None:
+    """
+    Just-In-Time level generator.
+    Takes the skeleton from ChromaDB and calls Ollama to generate the full
+    playable game level (persona, story, boss fight) on demand.
+    Returns a merged concept dict ready for start_session(), or None on failure.
+    """
+    loading_messages = [
+        "Pip is putting on her thinking cap... 🧢",
+        "Loading the boss fight logic... 👾",
+        "Sprinkling some puzzle dust... ✨",
+        "Waking up the local AI... 🤖",
+        "Brewing the perfect puzzle... ☕",
+    ]
+
+    jit_system = """\
+You are a game level designer for GemmaGenius, an educational app for children.
+
+### PERSONA SELECTION RULES:
+Choose a persona based on the complexity of the ground truth:
+- Simple/concrete facts → Persona = "Pip", Age 8, avatar_emoji "👧🏼", curious 8-year-old who uses toy and playground analogies.
+- Moderately complex → Persona = "Alex", Age 13, avatar_emoji "👦🏽", slightly skeptical, uses sports/social/allowance analogies.
+- Advanced/abstract → Persona = "Riley", Age 16, avatar_emoji "🕵️", overzealous detective who invents wild confident-but-wrong theories.
+
+### OUTPUT RULES:
+Return ONLY a valid JSON object. No markdown. No extra keys.
+
+{
+  "persona_config": {
+    "name": "[Pip, Alex, or Riley]",
+    "age": [8, 13, or 16],
+    "avatar_emoji": "[👧🏼, 👦🏽, or 🕵️]",
+    "voice_tone": "Brief description matching the persona rules above"
+  },
+  "story_intro": "The persona presents a confused scenario about the concept, in character, ending with a question.",
+  "verification_scenario": "A follow-up where the persona tests their understanding by applying the concept — but makes a subtle logical mistake. Ends with 'right?'",
+  "boss_fight_logic": "The exact wrong assumption the persona makes in verification_scenario that the student must correct.",
+  "home_activity": "A simple real-world parent-child activity to reinforce this concept."
+}
+"""
+
+    jit_user = (
+        f"CONCEPT: {concept_name}\n"
+        f"CORE FACT: {ground_truth_logic}\n\n"
+        "Generate the game level JSON:"
+    )
+
+    with st.spinner(random.choice(loading_messages)):
+        raw = call_ollama(jit_system, jit_user, json_mode=True)
+
+    # Strip markdown fences just in case
+    clean = raw.strip()
+    if clean.startswith("```"):
+        clean = clean.split("\n", 1)[-1]
+    if clean.endswith("```"):
+        clean = clean.rsplit("```", 1)[0]
+    clean = clean.strip()
+
+    try:
+        generated = json.loads(clean)
+    except json.JSONDecodeError:
+        return None
+
+    # Merge generated layer onto the skeleton so all metadata is preserved
+    base = (skeleton or {}).copy()
+    base.update(generated)
+    base.setdefault("name", concept_name)
+    base.setdefault("concept_name", concept_name)
+    base.setdefault("ground_truth_logic", ground_truth_logic)
+    return base
+
+
 def make_concept_key(name: str, existing_keys: list) -> str:
     """Produce a unique snake_case key for a new concept entry."""
     sanitized = "_".join(name.split())[:30]
@@ -1152,17 +1228,37 @@ def main() -> None:
                                     use_container_width=True,
                                 ):
                                     st.session_state.current_concept_id = cid
-                                    concept_data = concept_obj.copy()
 
-                                    # Scenario Polymorphism
-                                    if "variants" in concept_data:
-                                        variant = random.choice(concept_data["variants"])
-                                        concept_data["story_intro"]               = variant["story_intro"]
-                                        concept_data["verification_scenario"]     = variant["verification_scenario"]
-                                        concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+                                    # Decide whether JIT generation is needed.
+                                    # Legacy knowledge.json concepts already have story_intro;
+                                    # ChromaDB skeleton concepts (JIT) do not.
+                                    has_story = bool(concept_obj.get("story_intro"))
 
-                                    start_session(concept_data)
-                                    st.rerun()
+                                    if has_story:
+                                        # Legacy path — use concept as-is (Scenario Polymorphism)
+                                        concept_data = concept_obj.copy()
+                                        if "variants" in concept_data:
+                                            variant = random.choice(concept_data["variants"])
+                                            concept_data["story_intro"]               = variant["story_intro"]
+                                            concept_data["verification_scenario"]     = variant["verification_scenario"]
+                                            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+                                        start_session(concept_data)
+                                        st.rerun()
+                                    else:
+                                        # JIT path — generate story + boss fight on the fly
+                                        ground_truth = concept_obj.get("ground_truth_logic", "")
+                                        concept_data = generate_level_jit(
+                                            concept_name, ground_truth, skeleton=concept_obj
+                                        )
+                                        if concept_data:
+                                            start_session(concept_data)
+                                            st.rerun()
+                                        else:
+                                            st.error(
+                                                "Pip got confused generating this puzzle! "
+                                                "Try clicking the level again.",
+                                                icon="❌",
+                                            )
                             else:
                                 st.button(
                                     f"🔒 {concept_name}",

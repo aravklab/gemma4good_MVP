@@ -158,42 +158,26 @@ def semantic_chunk_text(
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """
-You are an expert pedagogical AI. Your task is to extract educational concepts from the provided text and format them for an interactive learning game.
+You are a curriculum extraction AI. Your only job is to read educational text and extract the structural skeleton of each concept — a title and the core factual logic. Do NOT write stories, scenarios, personas, or boss fights. Those are generated later.
 
 ### EXTRACTION RULES:
-1. Do NOT stop after one concept. You MUST extract a distinct concept for EVERY major section or numbered heading in the text.
-2. If the text has 4 sections, you must output 4 concepts in the array.
-
-### PERSONA SELECTION RULES:
-Analyze the reading level of the provided text to choose the correct persona for the student:
-- Primary/Ages 7-10: Persona = "Pip", Age 8. (Curious, uses toy/playground analogies).
-- Intermediate/Ages 11-14: Persona = "Alex", Age 13. (Slightly skeptical, uses sports/social/allowance analogies).
-- Advanced/Ages 15+: Persona = "Riley", Age 16. (The "Overzealous Detective", invents wild, confident but flawed theories).
+1. Extract a distinct concept for EVERY major section or numbered heading in the text. Do NOT stop after one.
+2. Focus on accuracy: ground_truth_logic must be a precise, factual 1-3 sentence summary of the core mechanism.
+3. concept_name must be a concise, catchy title (5 words or fewer).
 
 ### TARGET SCHEMA:
-You must return ONLY a raw JSON object matching this exact structure. No markdown formatting.
+Return ONLY a raw JSON object. No markdown formatting. No extra keys.
 
 {
   "extracted_concepts": [
     {
       "concept_name": "Catchy Title",
-      "name": "Catchy Title",
-      "persona_config": {
-        "name": "[Pip, Alex, or Riley]",
-        "age": [8, 13, or 16],
-        "avatar_emoji": "[👧🏼, 👦🏽, or 🕵️]",
-        "voice_tone": "[Brief description of how they speak based on rules above]"
-      },
-      "story_intro": "The persona presents a confused scenario or flawed theory based on the concept.",
-      "ground_truth_logic": "The core fact the user must teach them.",
-      "verification_scenario": "A follow-up question where the persona tests their new understanding.",
-      "boss_fight_logic": "A logic trap where the persona makes a smart-sounding but incorrect assumption.",
-      "home_activity": "A simple real-world physical activity a parent and child can do together to explore this concept."
+      "ground_truth_logic": "The precise core fact the student must understand."
     }
   ]
 }
 
-If the source text does not contain enough content for even one meaningful concept, output: {"skip": true}
+If the source text does not contain enough meaningful educational content, output: {"skip": true}
 """
 
 
@@ -202,7 +186,7 @@ def call_ollama(chunk: str, model: str) -> str:
     payload = {
         "model":  model,
         "system": SYSTEM_PROMPT,
-        "prompt": f"SOURCE TEXT:\n{chunk}\n\nAnalyse complexity, select persona, then generate the concept JSON:",
+        "prompt": f"SOURCE TEXT:\n{chunk}\n\nExtract the concept skeleton JSON:",
         "stream": False,
         "format": "json",
     }
