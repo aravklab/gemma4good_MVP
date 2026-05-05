@@ -863,6 +863,7 @@ def init_session_state() -> None:
         "last_spoken_idx": -1,     # TTS: index of last message already spoken (avoids replay on rerun)
         "last_audio_hash":        "",   # STT: MD5 of last processed audio — prevents double-submission on rerun
         "pending_transcription":  "",   # STT: transcribed text waiting for user to review/edit before sending
+        "balloons_shown":         False, # Win: one-shot guard — prevents balloon from refiring on every rerun
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -890,7 +891,8 @@ def start_session(concept_data: dict) -> None:
     st.session_state.session_won           = False
     st.session_state.game_started          = True
     st.session_state.last_spoken_idx       = -1  # reset TTS pointer for the new session
-    st.session_state.pending_transcription = ""  # clear any stale mic draft
+    st.session_state.pending_transcription = ""   # clear any stale mic draft
+    st.session_state.balloons_shown        = False # arm the balloon for this session
 
     st.session_state.messages.append({
         "role":    "assistant",
@@ -1679,7 +1681,11 @@ def main() -> None:
 
     # ── Win state: show celebration and block further input ───────────────────
     if st.session_state.session_won:
-        st.balloons()
+        # Fire balloons exactly once — calling st.balloons() on every rerun
+        # resets the animation mid-flight (e.g. the TTS iframe triggers a micro-rerun).
+        if not st.session_state.get("balloons_shown", False):
+            st.balloons()
+            st.session_state.balloons_shown = True
         st.success(f"⭐ TRUE MASTERY ACHIEVED! You explained the concept AND caught {persona_name}'s mistake!")
         st.info("Choose a concept in the sidebar and click **Start / Reset Puzzle** to play again!")
         st.stop()
@@ -1734,30 +1740,6 @@ def main() -> None:
     user_input: str | None = None
 
     if st.session_state.get("mic_enabled") and AUDIO_RECORDER_AVAILABLE:
-        # Pulsing animation injected into the page — visible while mic mode is active.
-        # Because the recorder widget lives inside a cross-origin iframe we cannot
-        # detect its internal recording/idle state from JS, so we pulse the ring
-        # continuously while mic mode is on. The red→dark-green button color change
-        # inside the widget is the definitive signal.
-        st.markdown("""
-<style>
-@keyframes mic-pulse {
-    0%   { box-shadow: 0 0 0 0  rgba(232,65,24,.65); }
-    60%  { box-shadow: 0 0 0 10px rgba(232,65,24,.0); }
-    100% { box-shadow: 0 0 0 0  rgba(232,65,24,.0); }
-}
-/* Target the container div that Streamlit wraps around the second column */
-div[data-testid="stHorizontalBlock"] > div:nth-child(2) {
-    display: flex;
-    align-items: flex-end;
-    justify-content: center;
-}
-div[data-testid="stHorizontalBlock"] > div:nth-child(2) iframe {
-    border-radius: 50%;
-    animation: mic-pulse 1.6s ease-out infinite;
-}
-</style>""", unsafe_allow_html=True)
-
         # Side-by-side layout: wide text input + narrow mic button
         input_col, mic_col = st.columns([6, 1])
         with input_col:
@@ -1771,6 +1753,26 @@ div[data-testid="stHorizontalBlock"] > div:nth-child(2) iframe {
                 icon_size="2x",
                 pause_threshold=4.0,
                 key="mic_recorder",
+            )
+            # Pulsing dot injected directly inside the mic column — avoids
+            # the iframe box-shadow misalignment caused by targeting the
+            # recorder's cross-origin iframe via CSS selectors.
+            st.markdown(
+                """
+<style>
+@keyframes mic-dot-pulse {
+    0%,100% { transform: scale(1);   opacity: 1;   }
+    50%      { transform: scale(2.2); opacity: 0.25; }
+}
+</style>
+<div style="display:flex; justify-content:center; margin-top:4px;">
+  <span style="
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #1a9e5c; display: inline-block;
+    animation: mic-dot-pulse 1.5s ease-in-out infinite;
+  "></span>
+</div>""",
+                unsafe_allow_html=True,
             )
 
         # Status legend below the mic — always visible
@@ -1885,7 +1887,9 @@ div[data-testid="stHorizontalBlock"] > div:nth-child(2) iframe {
                 st.session_state.messages.append({"role": "assistant", "content": win_msg})
                 st.session_state.session_ended = True
                 st.session_state.session_won   = True
-                st.balloons()
+                # st.balloons() intentionally NOT called here — st.rerun() immediately
+                # follows and would abort the effect before it reaches the browser.
+                # The one-shot balloon fires in the win-render block above instead.
                 st.rerun()
 
             # ── Phase 1 Mastery → seamless transition via a single Pip turn ──
