@@ -123,6 +123,7 @@ def _embed_and_upsert_concept(concept: dict, status: str = "pending") -> bool:
         "complexity_level": persona.get("complexity_level", ""),
         "persona_name":     persona.get("name", ""),
         "subject":          concept.get("subject", "General"),
+        "sequence_order":   int(concept.get("sequence_order", 999)),
         "status":           status,
     }
     collection = get_chroma_collection()
@@ -870,12 +871,29 @@ def render_dashboard(knowledge: dict) -> None:
                 # Legacy: bare single object
                 concepts_to_embed = [parsed]
 
+            # Determine the next sequence number for this subject in ChromaDB
+            try:
+                _existing = get_chroma_collection().get(
+                    where   = {"subject": selected_subject},
+                    include = ["metadatas"],
+                )
+                existing_seqs = [
+                    int(m.get("sequence_order", 0))
+                    for m in _existing.get("metadatas", [])
+                    if m.get("sequence_order") is not None
+                ]
+                next_seq = max(existing_seqs, default=0) + 1
+            except Exception:
+                next_seq = 1
+
             embedded_count = 0
             failed_names   = []
             for concept in concepts_to_embed:
                 concept.setdefault("concept_name", concept.get("name", "Untitled Concept"))
                 concept.setdefault("name", concept["concept_name"])
-                concept["subject"] = selected_subject  # stamp subject chosen by parent
+                concept["subject"]        = selected_subject   # stamp subject chosen by parent
+                concept["sequence_order"] = next_seq           # stamp sequential order
+                next_seq += 1
                 with st.spinner(f"Embedding **'{concept['concept_name']}'**…"):
                     ok = _embed_and_upsert_concept(concept, status="pending")
                 if ok:
@@ -936,7 +954,10 @@ def main() -> None:
                 concept_obj = json.loads(meta.get("concept_json", "{}"))
             except json.JSONDecodeError:
                 concept_obj = {}
+            # Backfill flat metadata fields that may not be inside concept_json
             concept_obj.setdefault("name", meta.get("concept_name", cid))
+            concept_obj.setdefault("subject", meta.get("subject", "General"))
+            concept_obj.setdefault("sequence_order", meta.get("sequence_order", 999))
             chroma_concepts[cid] = concept_obj
     except Exception as exc:
         st.warning(f"⚠️ Could not load concepts from ChromaDB: {exc}", icon="⚠️")
