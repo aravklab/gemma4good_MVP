@@ -796,6 +796,46 @@ def render_dashboard(knowledge: dict) -> None:
 
         st.divider()
 
+    # ── Sequence Repair ───────────────────────────────────────────────────────
+    with st.expander("🔧 Repair Sequence Numbers", expanded=False):
+        st.caption(
+            "Concepts uploaded before sequencing was introduced have "
+            "sequence_order=999. Click below to assign real numbers based on "
+            "the current order within each subject."
+        )
+        if st.button("🔢 Assign Sequence Numbers to All Concepts",
+                     use_container_width=True):
+            try:
+                col     = get_chroma_collection()
+                all_res = col.get(include=["metadatas"])
+                all_ids = all_res.get("ids", [])
+                all_metas = all_res.get("metadatas", [])
+
+                # Group by subject, then assign 1-based order
+                by_subject: dict = {}
+                for cid, meta in zip(all_ids, all_metas):
+                    subj = meta.get("subject", "General")
+                    by_subject.setdefault(subj, []).append((cid, meta))
+
+                updated = 0
+                for subj, entries in by_subject.items():
+                    for seq_num, (cid, meta) in enumerate(entries, start=1):
+                        if int(meta.get("sequence_order", 999)) == 999:
+                            col.update(
+                                ids       = [cid],
+                                metadatas = [{**meta, "sequence_order": seq_num}],
+                            )
+                            updated += 1
+
+                if updated:
+                    st.success(f"✅ Assigned sequence numbers to {updated} concept(s). Refresh the page.")
+                else:
+                    st.info("All concepts already have sequence numbers assigned.")
+            except Exception as exc:
+                st.error(f"Repair failed: {exc}")
+
+    st.divider()
+
     # ── PDF Ingestion ─────────────────────────────────────────────────────────
     st.subheader("📄 Ingest New Concept from PDF")
     st.caption(
@@ -1031,8 +1071,13 @@ def main() -> None:
                             is_mastered  = cid in achievements
                             is_playing   = cid == active_id
 
-                            # Unlocked if already mastered OR within the buffer window
-                            is_unlocked = is_mastered or (seq <= max_mastered_seq + LOOK_AHEAD)
+                            # seq=999 means the concept predates sequencing — treat as unlocked
+                            # so legacy / pre-migration concepts are always accessible
+                            is_unlocked = (
+                                is_mastered
+                                or seq == 999
+                                or seq <= max_mastered_seq + LOOK_AHEAD
+                            )
 
                             if is_unlocked:
                                 if is_mastered:
