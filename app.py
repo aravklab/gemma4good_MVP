@@ -771,7 +771,7 @@ def init_session_state() -> None:
         "last_classification":        "None", # debug: last evaluator verdict
         "last_evaluator_rationale":   "None", # debug: raw evaluator JSON before parsing
         # audio
-        "voice_enabled":   True,   # TTS: persona speaks its responses aloud
+        "voice_enabled":   False,  # TTS: off by default — user opts in via Audio Settings
         "mic_enabled":     False,  # STT: show microphone recorder widget
         "last_spoken_idx": -1,     # TTS: index of last message already spoken (avoids replay on rerun)
     }
