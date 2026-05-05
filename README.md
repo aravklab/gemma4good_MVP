@@ -37,14 +37,12 @@ streamlit run app.py
 | Batch PDF ingestion | `ingest.py` | `python ingest.py <file.pdf>` |
 
 - `app.py` reads approved concepts from **ChromaDB** (local vector store) and generates levels Just-In-Time.
-- `main.py` is the original terminal interface; still reads from `knowledge.json`.
+- `main.py` is the original terminal interface; reads from `knowledge.json`.
 - `ingest.py` processes PDFs and writes skeletons to ChromaDB.
 
 ---
 
 ## How It Works
-
-The core idea is that the best way to test understanding is to make the learner *teach*. GemmaGenius puts the student in the role of teacher: a confused AI persona asks them to explain a concept. The student must find the right words, and the persona reacts based on how close they are.
 
 Two AI units share the same local Ollama model but serve completely different roles:
 
@@ -53,18 +51,21 @@ Two AI units share the same local Ollama model but serve completely different ro
                     │   SIDEBAR — Subject Folders       │
                     │  📁 Biology                       │
                     │    ▶ Photosynthesis               │
-                    │    🔒 Osmosis                     │
+                    │    🔄 Osmosis  (retry unlocked)   │
+                    │    🆘 Mitosis  (needs help)       │
+                    │    🔒 Genetics (locked)           │
                     │  📁 General                       │
                     │    ⭐ Right Angles (mastered)     │
                     └──────────────┬───────────────────┘
                                    │ concept clicked
                                    ▼
                          generate_level_jit()
-                    (if skeleton — Ollama generates
-                     fresh story + persona + boss fight)
+                    (Ollama generates fresh story,
+                     persona, boss fight — or injects
+                     narrative continuity on retry)
                                    │
                                    ▼
-Student types an answer
+Student submits answer (typed or spoken)
         │
         ▼
 ┌─────────────────┐   JSON verdict          ┌──────────────────┐
@@ -89,39 +90,72 @@ Student types an answer
   Click an unlocked concept
         │
         ▼
-  generate_level_jit()  ← (skeleton concepts only)
-  Creates a FRESH story, persona, boss fight on every click
+  generate_level_jit()
+  → Fresh story + random setting every click
+  → If concept has a resolved struggle, Pip opens with
+    narrative continuity ("Remember how we got stuck on this?")
         │
         ▼
 PHASE 1 — ELICITATION
-  Persona presents story_intro (no Ollama call for Turn 0)
+  Persona presents story_intro
   → Student must explain the concept correctly
+
+  FRUSTRATION LADDER (on each miss):
+    Miss 1: Bridging Constraint — anchor to puzzle, ask again
+    Miss 2: Disguised mega-hint — persona voices growing doubt
+    Miss 3+: Aha! rescue — persona models the answer, student echoes it back
         │
-        ▼  (seamless transition — single Ollama call)
-  Persona validates the student, then IMMEDIATELY presents
-  a DELIBERATE MISTAKE from verification_scenario.
+        ▼  (mastery — seamless single Ollama call transition)
+  Persona validates, immediately presents a DELIBERATE MISTAKE
         │
         ▼
 PHASE 2 — BOSS FIGHT (Verification)
   → Student must catch and correct the persona's wrong application
+  (same frustration ladder applies)
         │
         ▼  (Phase 2 mastery)
-  ★ TRUE MASTERY ACHIEVED ★  →  achievement saved  →  concept shows ⭐
+  ⭐ TRUE MASTERY ACHIEVED  →  achievement saved  →  balloon animation
 
-  ─── At any point ───
-  Student gives up
+  ─── At any point ───────────────────────────────────────────────
+  Student gives up OR clarification loop hits threshold
         │
-        ▼  (give_up — OVERRIDE FIREWALL)
-  Persona reveals the answer, asks: "Want to try explaining it to me?"
-        ├── yes  →  counters reset, puzzle replays from current phase
-        └── no   →  "Session ended gracefully."
+        ▼
+  Persona explains answer (OVERRIDE FIREWALL), then:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  ✅ Yes, try again!  →  counters reset, puzzle replays        │
+  │  ❌ No, I'm done     →  session ends gracefully              │
+  │                         concept flagged 🆘 in profile         │
+  └──────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## The Student Struggle State Machine
+
+GemmaGenius tracks three states per concept in `student_profile.json`:
+
+| Sidebar icon | State | What happened |
+|---|---|---|
+| ○ / ▶ | Untouched | Never attempted |
+| ⭐ | Mastered | Phase 2 win — achievement saved |
+| 🆘 | Needs Help (active) | Abandoned — locked until parent intervenes |
+| 🔄 | Resolved | Parent unlocked after intervention — Pip will open with narrative continuity |
+
+**Parent Dashboard flow:**
+1. Parent sees the **🆘 Needs Help** section — exit reason, attempt count, suggested home activity
+2. Parent does the activity IRL with the child
+3. Parent clicks **🔓 Unlock** — concept moves to `resolved` state
+4. Child clicks **🔄** in the sidebar — Pip opens: *"Hey! Remember how we got stuck on this before? I've been thinking about it..."*
+5. If the child masters it → `🔄 Comeback!` badge in the achievements table
+6. If the child fails again → concept re-locks to 🆘 with incremented attempt count
+
+The parent can also **🔒 Re-lock** a resolved concept if the child needs more preparation before retrying.
 
 ---
 
 ## JIT Architecture (Just-In-Time Level Generation)
 
-GemmaGenius separates **ingestion** from **story generation**:
+GemmaGenius separates **ingestion** (fast skeleton extraction) from **story generation** (rich, dynamic, on-demand):
 
 ```
 INGESTION TIME (ingest.py)        PLAY TIME (app.py)
@@ -129,24 +163,27 @@ INGESTION TIME (ingest.py)        PLAY TIME (app.py)
 PDF → semantic chunks             Student clicks concept
     → LLM extracts skeleton:          │
       {concept_name,                  ▼
-       ground_truth_logic}        generate_level_jit()
-    → nomic-embed-text                │  Ollama generates:
-    → ChromaDB upsert                 │  persona_config
-      status: "pending"               │  story_intro
-                                      │  verification_scenario
-Parent approves in Dashboard          │  boss_fight_logic
-    → status: "approved"              │  home_activity
-    → visible to student              │
-                                      ▼
+       ground_truth_logic}        generate_level_jit(
+    → nomic-embed-text                  skeleton,
+    → ChromaDB upsert                   retry_context  ← if resolved struggle
+      status: "pending"             )
+                                          │
+Parent approves in Dashboard              │  Ollama generates:
+    → status: "approved"                  │  persona_config (Pip/Alex/Riley)
+    → visible to student                  │  story_intro + random setting seed
+                                          │  verification_scenario
+                                          │  boss_fight_logic
+                                          │  home_activity
+                                          ▼
                                   start_session(merged_concept)
                                   → FRESH story every click
 ```
 
 **Why JIT?**
 - Ingestion is fast — no story generation overhead per chunk
-- Every click generates a fresh story — a random real-world setting is injected into the prompt (playground, birthday party, science fair, camping trip, etc.) so the LLM cannot repeat itself
-- Only pure legacy `knowledge.json` concepts (no `ground_truth_logic`) use a static pre-written story
-- Reduces LLM context pressure during ingestion, improving skeleton quality
+- Every click generates a fresh story with a random real-world setting (playground, birthday party, science fair, camping trip, etc.) — the LLM cannot repeat itself
+- Retry sessions inject a **Narrative Continuity Directive** so Pip acknowledges the previous struggle rather than pretending it never happened
+- Only pure legacy `knowledge.json` concepts use a static pre-written story
 
 ---
 
@@ -157,17 +194,17 @@ Gemma4good/
 ├── app.py                      # Web UI — Streamlit (Kid Mode + Parent Dashboard)
 ├── main.py                     # CLI engine — original interface (legacy, knowledge.json only)
 ├── ingest.py                   # Batch PDF → ChromaDB skeleton ingestion pipeline
-├── knowledge.json              # Legacy concept graph (used by main.py + app.py as fallback)
-├── student_profile.json        # Persistent student achievements (auto-created on first win)
+├── knowledge.json              # Legacy concept graph (main.py + app.py fallback)
+├── student_profile.json        # Persistent student achievements + struggle records
 ├── rejected_telemetry.jsonl    # Dead Letter Queue — append-only rejected concept log
-├── requirements.txt            # Direct Python dependencies (pinned)
+├── requirements.txt            # Direct Python dependencies
+├── ARCHITECTURE.md             # Full system architecture, state machines, data flows
+├── LEARNINGS.md                # Hard-won technical lessons from building this
 ├── scripts/
 │   └── download_whisper_model.py   # One-time Whisper model download (SSL-proxy safe)
 ├── whisper_model/
 │   └── base/                   # Local Whisper model bundle (gitignored, ~145 MB)
-├── chroma_db/                  # Local ChromaDB vector store (gitignored, auto-created)
-├── LEARNINGS.md                # Architectural and technical lessons from building this
-└── README.md                   # This file
+└── chroma_db/                  # Local ChromaDB vector store (gitignored, auto-created)
 ```
 
 ---
@@ -178,88 +215,115 @@ Gemma4good/
 
 | View | Who uses it | What it shows |
 |---|---|---|
-| 🎮 Play (Kid Mode) | Student | Persona chat + subject sidebar |
+| 🎮 Play (Kid Mode) | Student | Persona chat + subject sidebar + audio controls |
 | 📊 Dashboard (Parent Mode) | Parent | Analytics, PDF ingestion, concept review, curriculum management |
 
 Switching views **never clears the active chat session** — the student's game is preserved if a parent checks the dashboard mid-session.
 
 ### Kid Mode — Subject Folders + Linear Path
 
-Concepts are grouped into subject folders in the sidebar (e.g., 📁 Biology, 📁 Mathematics). Within each folder, concepts are sorted by `sequence_order` (a float, explained below).
+Concepts are grouped into subject folders (e.g., 📁 Biology, 📁 Mathematics). Within each folder they are sorted by `sequence_order`.
 
 **Look-ahead Locking (buffer = 3):**
 
 ```
-  Pass 1: find max_mastered_seq — the highest sequence_order the student has mastered
-  Pass 2: for each concept in the folder:
-            if is_mastered                → ⭐ (always clickable)
-            if seq <= max_mastered + 3    → ▶ (unlocked, clickable)
-            if seq == 999                 → ○ (legacy, always unlocked)
-            else                          → 🔒 (locked, button disabled)
+Pass 1: find max_mastered_seq — highest sequence_order the student has mastered
+Pass 2: for each concept in the folder:
+          if is_mastered                  → ⭐  (always clickable)
+          if needs_help active            → 🆘  (disabled — ask a parent)
+          if needs_help resolved          → 🔄  (clickable — JIT gets retry_context)
+          if seq <= max_mastered + 3      → ▶   (unlocked, clickable)
+          if seq == 999                   → ○   (legacy, always unlocked)
+          else                            → 🔒  (locked, button disabled)
 ```
-
-This lets students work on up to 3 concepts simultaneously while preventing them from skipping ahead.
 
 ### Dynamic Persona System
 
-The persona is stored inside every concept's `persona_config` block and drives the entire UI:
+| Persona | Age | Avatar | Voice | Assigned when |
+|---|---|---|---|---|
+| **Pip** | 8 | 👧🏼 | Curious, toy/playground analogies | Simple / concrete facts |
+| **Alex** | 13 | 👦🏽 | Slightly sceptical, sports/social analogies | Moderately complex |
+| **Riley** | 16 | 🕵️ | Overzealous detective, wild confident-but-wrong theories | Advanced / abstract |
 
-| Persona | Age | Avatar | Voice |
-|---|---|---|---|
-| **Pip** | 8 | 👧🏼 | Curious, uses toy and playground analogies |
-| **Alex** | 13 | 👦🏽 | Slightly skeptical, uses sports/social/allowance analogies |
-| **Riley** | 16 | 🕵️ | Overzealous detective — invents wild, confidently wrong theories |
+The subheader, chat avatar, placeholder, win message, and error fallbacks all update automatically from `persona_config`. The escalation ladder prompts reference the persona's name but are otherwise persona-agnostic — Pip, Alex, and Riley all escalate through the same three tiers in their own voice.
 
-The Play Mode subheader, chat avatar, win message, chat placeholder, and error fallbacks all update automatically to reflect the active concept's persona.
+### Persistence Layer (`student_profile.json`)
 
-### Persistence Layer
+```json
+{
+  "student_name": "Explorer",
+  "achievements": {
+    "right_angle": {
+      "status": "Mastered",
+      "frustration_triggers": 1,
+      "boss_fight_attempts": 2,
+      "was_retry": false
+    }
+  },
+  "needs_help": {
+    "photosynthesis": {
+      "status": "resolved",
+      "attempts": 2,
+      "exit_reason": "give_up",
+      "timestamp": "2026-05-05T23:09:00",
+      "resolved_at": "2026-05-06T08:30:00"
+    }
+  }
+}
+```
 
-- `student_profile.json` — loaded once per session into `st.session_state.profile`.
-- Achievements are keyed by the **stable slug ID** (e.g. `right_angle`), not the display name. This prevents duplicates if a concept's name changes.
-- On Phase 2 win, the achievement is written to disk immediately via `save_profile()`.
+- `achievements` — keyed by stable slug ID (not display name); written on Phase 2 mastery
+- `needs_help` — keyed by same slug ID; `status: active` = locked, `status: resolved` = parent unlocked
+- `was_retry: true` in an achievement means the student mastered it after at least one previous abandonment
 
 ### Parent Dashboard Sections
 
 | Section | What it does |
 |---|---|
-| Summary Metrics | Concepts Mastered + Learning Friction (total frustration triggers) |
-| Concept Breakdown | DataFrame with per-concept status, frustration triggers, boss-fight attempts |
-| Suggested Activity | Reads `home_activity` from the highest-friction concept's JSON — no hardcoded lookup |
-| Review Queue | ChromaDB query for `status: pending`; Approve (sets `approved`) or Reject & Delete (logs + deletes vector) |
-| PDF Upload | Assigns subject + uploads PDF → AI extracts skeleton concepts → lands in Review Queue |
-| 🔧 Repair Sequence Numbers | Assigns proper 1-based sequence numbers to any concepts still at `sequence_order=999` |
-| 📋 Active Curriculum | Lists all approved concepts; "Remove" button deletes from ChromaDB and preserves achievement name |
+| **Summary Metrics** | Concepts Mastered · Learning Friction · 🆘 Needs Help count |
+| **Concept Breakdown** | DataFrame with ⭐ Mastered / 🔄 Comeback!, friction triggers, boss-fight attempts |
+| **Suggested Home Activity** | Reads `home_activity` from the highest-friction mastered concept |
+| **🆘 Needs Help** | Abandoned concepts with exit reason, attempt count, home_activity hint, 🔓 Unlock / 🔒 Re-lock buttons |
+| **Review Queue** | ChromaDB `status: pending`; Approve All or individual Approve / Reject & Delete |
+| **PDF Upload** | Subject selector + uploader → skeleton extraction → Review Queue |
+| **Active Curriculum** | Lists approved concepts; Remove button deletes vector, preserves achievement name |
+| **Repair Sequence Numbers** | Assigns proper 1-based sequence numbers to concepts still at `sequence_order=999` |
 
-### Routing — Bridging Constraint (Phase 1 Miss)
+### Routing — Phase 1 & 2
 
-When the Evaluator returns `miss`, the persona receives a **Bridging Constraint** directive that injects:
-1. The exact `story_intro` text (the original puzzle)
-2. The student's last message (verbatim)
-
-The persona must acknowledge what the student said, explain why it doesn't fix *that specific puzzle*, and ask again. This eliminates topic drift on incorrect answers.
-
-### Dead Letter Queue (DLQ)
-
-When a parent rejects a concept:
-1. The full concept JSON + rejection reason append to `rejected_telemetry.jsonl` (safe to `jq` / `pandas`).
-2. The vector is physically deleted from ChromaDB to prevent context pollution.
+| Verdict | Phase 1 behaviour | Phase 2 behaviour |
+|---|---|---|
+| `mastery` | OVERRIDE: validate + present boss scenario | ⭐ WIN: save achievement, balloons |
+| `partial_hit` | Validate partial, ask guiding question | Validate partial, ask follow-up |
+| `miss` (1st) | Bridging Constraint: anchor to `story_intro` | Nudge toward scenario flaw |
+| `miss` (2nd) | Disguised mega-hint as a wondering question | Hint via growing doubt about the scenario |
+| `miss` (3+) | Aha! rescue — model the answer in character | "Oh no — MY idea was wrong!" — model the answer |
+| `off_topic` | Acknowledge, re-state `story_intro` verbatim | Acknowledge, re-state `verification_scenario` |
+| `question` (1–2) | Answer briefly, re-state puzzle verbatim | Answer briefly, re-state scenario verbatim |
+| `question` (3+) | Warm exit → `trigger_retry = True` | Warm exit → `trigger_retry = True` |
+| `give_up` | OVERRIDE: reveal answer, ask Yes/No retry | OVERRIDE: reveal boss answer, ask Yes/No retry |
 
 ### Developer Console
 
-Toggle **🐛 Enable Debug Mode** in the sidebar. Reveals:
-
-- **🧠 Background Evaluator** — classification verdict and raw JSON
-- **👧🏼 Persona Generation** — full prompt sent and raw LLM output
+Toggle **🐛 Enable Debug Mode** in the sidebar to reveal:
+- **🧠 Background Evaluator** — classification verdict and rationale
+- **Persona Generation** — full system prompt sent + raw LLM output
 - **💾 Session State** — live JSON dump of all counters, phase, and concept data
 
-### Audio Settings (opt-in)
+---
 
-Both audio features are **off by default** and enabled via the **Audio Settings** expander in the sidebar.
+## Audio Settings (opt-in, off by default)
 
-| Feature | Default | How it works |
-|---|---|---|
-| Speak persona responses (TTS) | Off | Uses the browser's built-in Web Speech API (SpeechSynthesis). Zero install. Chrome/Edge only. Each persona has a distinct voice profile (pitch + rate). |
-| Mic input — speak your answer (STT) | Off | Records a WAV clip via `audio_recorder_streamlit`, transcribes locally with `faster-whisper` (base model, ~145 MB). No cloud call. |
+| Feature | How it works |
+|---|---|
+| **Speak persona responses (TTS)** | Browser `SpeechSynthesis` API — zero install, Chrome/Edge only. Each persona has a distinct pitch/rate profile. |
+| **Mic input — speak your answer (STT)** | `audio_recorder_streamlit` records a WAV clip; `faster-whisper` (base model, local) transcribes it. No cloud call. |
+
+**Mic input flow:**
+1. Click the green mic button → turns red when recording
+2. Click again (or wait 4 s of silence) to stop
+3. Transcribed text appears in an **editable text area** — correct any mishearing
+4. Click **Send ✓** to submit, or **Re-record ✗** to discard
 
 **Persona voice profiles:**
 
@@ -269,18 +333,16 @@ Both audio features are **off by default** and enabled via the **Audio Settings*
 | Alex (13) | 1.1 | 1.0 | Neutral teen voice |
 | Riley (16) | 0.9 | 1.1 | Lower, faster — detective energy |
 
-**Mic usage:** Click the mic button → speak → click again to stop (or pause for 4 seconds to auto-stop). The transcribed text appears in a confirmation box before being submitted. Typed input always takes priority over mic input if both are present.
-
 **One-time Whisper model setup (required for mic input):**
 
 ```powershell
 python scripts/download_whisper_model.py
 ```
 
-Downloads ~145 MB to `./whisper_model/base/` using plain HTTP (no `huggingface_hub` dependency at runtime, SSL-proxy safe). To upgrade the model quality:
+Downloads ~145 MB to `./whisper_model/base/` using plain HTTP (SSL-proxy safe, no `huggingface_hub` dependency). To upgrade model quality:
 
 ```powershell
-python scripts/download_whisper_model.py --model small   # 460 MB, better accuracy
+python scripts/download_whisper_model.py --model small   # 460 MB, more accurate
 ```
 
 Then update `WHISPER_MODEL_PATH = "./whisper_model/small"` at the top of `app.py`.
@@ -289,17 +351,12 @@ Then update `WHISPER_MODEL_PATH = "./whisper_model/small"` at the top of `app.py
 
 ## ingest.py — Batch PDF Ingestion Pipeline
 
-Standalone CLI script. Reads a PDF → semantic chunks with overlap → skeleton extraction → ChromaDB upsert.
-
 ```powershell
 # Preview without writing
 python ingest.py notes.pdf --dry-run
 
-# Full ingestion: Biology, Chapter 2
+# Full ingestion: Biology, Module 2
 python ingest.py chapter2.pdf --subject Biology --module 2
-
-# Limit chunks during development
-python ingest.py notes.pdf --chunk-limit 3 --dry-run
 ```
 
 ### CLI Options
@@ -308,16 +365,15 @@ python ingest.py notes.pdf --chunk-limit 3 --dry-run
 |---|---|---|
 | `--dry-run` | off | Print JSON to terminal, do not write to ChromaDB |
 | `--model NAME` | `gemma4:e4b` | Ollama model for concept extraction |
-| `--embed-model NAME` | `nomic-embed-text` | Ollama model for embeddings |
-| `--chroma-path PATH` | `./chroma_db` | Local ChromaDB persistence directory |
-| `--collection NAME` | `curriculum` | ChromaDB collection name |
+| `--embed-model NAME` | `nomic-embed-text` | Ollama embeddings model |
+| `--chroma-path PATH` | `./chroma_db` | ChromaDB persistence directory |
+| `--subject NAME` | `General` | Subject tag applied to all extracted concepts |
+| `--module N` | `1` | Module number for fractional sequencing (`2.1`, `2.2`, …) |
 | `--max-chars N` | `3000` | Max characters per semantic chunk |
 | `--overlap N` | `300` | Character overlap between adjacent chunks |
 | `--chunk-limit N` | all | Process at most N chunks |
-| `--subject NAME` | `General` | Subject category tag applied to all concepts |
-| `--module N` | `1` | Module number for fractional sequencing |
 
-### Skeleton Schema (what ingest.py stores)
+### Skeleton Schema (what `ingest.py` stores)
 
 ```json
 {
@@ -329,142 +385,34 @@ python ingest.py notes.pdf --chunk-limit 3 --dry-run
 }
 ```
 
-The `story_intro`, `persona_config`, `verification_scenario`, `boss_fight_logic`, and `home_activity` are **NOT** stored at ingestion time — they are generated by `generate_level_jit()` in `app.py` on every concept click.
-
-### Fractional Sequencing
-
-```
---module 1  →  concepts numbered  1.1, 1.2, 1.3 …
---module 2  →  concepts numbered  2.1, 2.2, 2.3 …
-```
-
-Multiple chapters can be ingested independently without renumbering. The Parent Dashboard's "Repair Sequence Numbers" tool can fix legacy concepts still at `sequence_order=999`.
-
-### Safety Features
-
-- Semantic chunking with configurable overlap — avoids cutting concepts mid-paragraph
-- Deterministic IDs (slugified concept name) — `upsert` prevents duplicates on re-ingestion
-- JSON parse error recovery — strips markdown fences, handles `{"skip": true}` signal
-- All concepts start `status: "pending"` — nothing enters gameplay without parent approval
+`story_intro`, `persona_config`, `verification_scenario`, `boss_fight_logic`, and `home_activity` are **not** stored at ingestion time — they are generated by `generate_level_jit()` on every concept click.
 
 ---
 
 ## ChromaDB Concept Lifecycle
 
 ```
-  ingest.py / in-app PDF upload
+ingest.py / in-app PDF upload
         │
         ▼
-  status: "pending"   ←── visible in Parent Dashboard Review Queue
+  status: "pending"    ← Parent Dashboard Review Queue
         │
-        ├── ✅ Approve    →  status: "approved"  ←── visible to students
+        ├── ✅ Approve    → status: "approved"  ← visible to students
         │
-        └── 🗑️ Reject     →  logged to rejected_telemetry.jsonl (DLQ)
+        └── 🗑️ Reject     → logged to rejected_telemetry.jsonl (DLQ)
                               + physically deleted from ChromaDB
-```
-
-Concepts from `knowledge.json` are loaded as a legacy fallback and merged with ChromaDB concepts in `app.py`'s `main()` function. ChromaDB concepts take precedence on name collision.
-
----
-
-## Evaluator Classification States
-
-| State | Meaning |
-|---|---|
-| `mastery` | Student clearly explained the core mechanism (simple language is fine) |
-| `partial_hit` | Relevant ideas present but explanation is incomplete |
-| `miss` | Wrong, confused, guessing, or parroting vocabulary without explaining mechanism |
-| `question` | Student asked a clarifying question or requested a hint |
-| `off_topic` | Joke, nonsense, or completely unrelated topic |
-| `give_up` | Unambiguous, explicit surrender — a wrong answer is still `miss` |
-
----
-
-## Phase 1 Routing
-
-| Verdict | Counter effect | Persona behaviour |
-|---|---|---|
-| `mastery` | — | OVERRIDE FIREWALL: validate + immediately present boss scenario |
-| `partial_hit` | none | Validate what they got right, ask guiding question |
-| `miss` | `frustration++` | **Bridging Constraint**: anchor to original puzzle, ask again |
-| `off_topic` | none | Acknowledge, re-state exact `story_intro` verbatim |
-| `question` (1–2) | `clarification++` | Answer briefly, re-state exact `story_intro` verbatim |
-| `question` (3+) | none | "Maybe we should look at a book together" |
-| `give_up` | — | OVERRIDE FIREWALL: reveal answer, ask Yes/No retry |
-
-## Phase 2 Routing
-
-| Verdict | Counter effect | Persona behaviour |
-|---|---|---|
-| `mastery` | — | ★ TRUE MASTERY ACHIEVED ★ + save achievement |
-| `partial_hit` | none | Validate partial logic, ask follow-up |
-| `miss` | none | Act confused, nudge toward the flaw in the scenario |
-| `off_topic` | none | Acknowledge, re-state exact `verification_scenario` verbatim |
-| `question` (1–2) | `clarification++` | Answer briefly, re-state scenario verbatim |
-| `question` (3+) | none | "Maybe we should draw it out on paper" |
-| `give_up` | — | OVERRIDE FIREWALL: reveal answer, ask Yes/No retry |
-
----
-
-## Setup
-
-### Prerequisites
-
-- [Ollama](https://ollama.com) installed and running locally
-- Python 3.10+
-
-```powershell
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Pull Ollama models (one-time)
-ollama pull gemma4:e4b
-ollama pull nomic-embed-text
-
-# Keep Ollama running
-ollama serve
-```
-
-### Run — Web UI (recommended)
-
-```powershell
-cd "C:\Projects with Agents\Gemma4good"
-streamlit run app.py
-```
-
-### Enable Mic Input (optional, one-time)
-
-```powershell
-python scripts/download_whisper_model.py
-```
-
-Downloads the Whisper `base` model (~145 MB) to `./whisper_model/base/`. Works behind corporate SSL-inspection proxies. After downloading, enable **Mic input** in the **Audio Settings** sidebar expander.
-
-### Run — CLI
-
-```powershell
-cd "C:\Projects with Agents\Gemma4good"
-python main.py
-```
-
-### Swap the Model
-
-Edit `MODEL_NAME` at the top of `app.py` or `main.py`, and `DEFAULT_MODEL` in `ingest.py`:
-
-```python
-MODEL_NAME = "gemma4:e4b"   # any model you have pulled locally
 ```
 
 ---
 
 ## Architecture Constraints
 
-- **No agent frameworks** — no LangChain, LangGraph, AutoGen, or OpenAI SDK.
-- **Raw Python + `requests` only** — one dependency for all Ollama HTTP calls.
-- **Procedural state** — `session_state` keys and plain variables; no state machine libraries.
-- **Two logical units, one model** — Persona and Evaluator are prompt roles, not separate processes.
-- **Local vector store** — ChromaDB with `nomic-embed-text` embeddings via Ollama; no external DB.
-- **Privacy-first** — no data leaves the device; all inference and embedding runs on local Ollama.
+- **No agent frameworks** — no LangChain, LangGraph, AutoGen, or OpenAI SDK
+- **Raw Python + `requests`** — one dependency for all Ollama HTTP calls
+- **Procedural state** — `session_state` keys and plain variables; no state machine libraries
+- **Two logical units, one model** — Persona and Evaluator are prompt roles, not separate processes
+- **Local vector store** — ChromaDB with `nomic-embed-text` via Ollama; no external DB
+- **Privacy-first** — no data leaves the device; all inference and embedding runs on local Ollama
 
 ---
 
@@ -473,7 +421,7 @@ MODEL_NAME = "gemma4:e4b"   # any model you have pulled locally
 ### Via PDF — In-App (recommended)
 
 1. Open **Parent Dashboard** → scroll to "Generate Concept from PDF"
-2. Select a subject from the dropdown
+2. Select a subject
 3. Upload a PDF — the AI extracts one skeleton per major section
 4. Review each concept in the **Review Queue** and click ✅ Approve
 
@@ -486,17 +434,12 @@ python ingest.py your_material.pdf --subject Math     # write to ChromaDB
 
 Then open the Parent Dashboard to review and approve.
 
-### Manual Authoring
-
-Add concepts directly to `knowledge.json` for `main.py` (CLI). For the web UI, all concepts must pass through ChromaDB — use the in-app uploader or `ingest.py`.
-
 ---
 
-## What's Next (Planned Layers)
+## What's Next (Planned)
 
-- **Hint Ladder:** Use `frustration_counter` to trigger progressively stronger hints without giving the answer away.
-- **Session Scoring:** Report mastery rate, misses, and time-to-mastery at end of each concept; surface trends in the Parent Dashboard.
-- **Multi-student Profiles:** Support multiple named profiles in `student_profile.json` with a profile switcher in the sidebar.
-- **Frustration Alerts:** Parent Dashboard notification when a concept's friction score crosses a threshold.
-- **Semantic Concept Search:** Use ChromaDB's vector search to surface related concepts when a student struggles, enabling adaptive learning paths.
-- **JIT Story Caching:** Optionally cache the JIT-generated story on first play so the same story persists for a given student across sessions while remaining regeneratable on demand.
+- **Multi-student profiles** — multiple named profiles with a profile switcher in the sidebar
+- **Session scoring** — time-to-mastery, miss rate, frustration trend across sessions
+- **JIT story caching** — optionally cache the first JIT-generated story for a given student/concept pair so the same narrative persists across sessions while remaining regeneratable on demand
+- **Semantic concept search** — use ChromaDB similarity search to surface related concepts when a student struggles, enabling adaptive learning paths
+- **Frustration alerts** — Parent Dashboard notification when a concept's friction score crosses a configurable threshold
