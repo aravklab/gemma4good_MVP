@@ -838,14 +838,25 @@ def render_dashboard(knowledge: dict) -> None:
                 sys_p, usr_p = compile_concept_generation_prompt(extracted_text)
                 raw_json     = call_ollama(sys_p, usr_p, json_mode=True)
 
+            # Strip markdown fences the model sometimes adds even in JSON mode
+            clean_json = raw_json.strip()
+            if clean_json.startswith("```"):
+                # Remove opening fence (```json or ```)
+                clean_json = clean_json.split("\n", 1)[-1]
+            if clean_json.endswith("```"):
+                clean_json = clean_json.rsplit("```", 1)[0]
+            clean_json = clean_json.strip()
+
             try:
-                parsed = json.loads(raw_json)
-            except json.JSONDecodeError:
+                parsed = json.loads(clean_json)
+            except json.JSONDecodeError as exc:
                 st.error(
-                    "The AI returned malformed JSON. Try uploading a cleaner PDF "
-                    "or a shorter, more focused excerpt.",
+                    f"The AI returned malformed JSON ({exc}). "
+                    "Try uploading a cleaner PDF or a shorter excerpt.",
                     icon="❌",
                 )
+                with st.expander("🛠️ Raw LLM output (for debugging)"):
+                    st.code(raw_json[:3000], language="json")
                 st.stop()
 
             # Handle {skip: true} response
@@ -901,20 +912,47 @@ def main() -> None:
 
     init_session_state()
 
-    # ── Load knowledge graph ──────────────────────────────────────────────────
+    # ── Load knowledge graph (legacy hand-authored concepts from knowledge.json) ─
     try:
         with open("knowledge.json", "r", encoding="utf-8") as fh:
             knowledge = json.load(fh)
     except FileNotFoundError:
-        st.error("knowledge.json not found. Run `streamlit run app.py` from the project root.")
-        st.stop()
-    except json.JSONDecodeError as exc:
-        st.error(f"knowledge.json is malformed: {exc}")
-        st.stop()
+        knowledge = {"concepts": {}}
+    except json.JSONDecodeError:
+        knowledge = {"concepts": {}}
 
-    concepts      = knowledge.get("concepts", {})
+    legacy_concepts = knowledge.get("concepts", {})
+
+    # ── Load approved concepts from ChromaDB ─────────────────────────────────
+    chroma_concepts = {}   # key -> concept dict
+    try:
+        _col = get_chroma_collection()
+        approved = _col.get(
+            where   = {"status": "approved"},
+            include = ["metadatas"],
+        )
+        for cid, meta in zip(approved.get("ids", []), approved.get("metadatas", [])):
+            try:
+                concept_obj = json.loads(meta.get("concept_json", "{}"))
+            except json.JSONDecodeError:
+                concept_obj = {}
+            concept_obj.setdefault("name", meta.get("concept_name", cid))
+            chroma_concepts[cid] = concept_obj
+    except Exception as exc:
+        st.warning(f"⚠️ Could not load concepts from ChromaDB: {exc}", icon="⚠️")
+
+    # Merge: ChromaDB approved concepts take precedence; legacy fills the rest
+    concepts = {**legacy_concepts, **chroma_concepts}
     concept_keys  = list(concepts.keys())
     concept_names = [concepts[k]["name"] for k in concept_keys]
+
+    # ── Build subject-grouped index for the sidebar folder UI ─────────────────
+    # ChromaDB concepts carry a "subject" field; legacy ones default to "Classic"
+    grouped_concepts: dict[str, list[tuple[str, dict]]] = {}
+    for key in concept_keys:
+        concept_obj = concepts[key]
+        subject = concept_obj.get("subject", "Classic" if key in legacy_concepts else "General")
+        grouped_concepts.setdefault(subject, []).append((key, concept_obj))
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -941,26 +979,33 @@ def main() -> None:
 
         # Game controls are only meaningful in Play mode
         if nav_view == "🎮 Play (Kid Mode)":
-            selected_idx = st.selectbox(
-                "Choose a concept:",
-                range(len(concept_names)),
-                format_func=lambda i: concept_names[i],
-            )
+            if grouped_concepts:
+                st.subheader("📚 My Subjects")
+                for subject, items in sorted(grouped_concepts.items()):
+                    # Keep subject folders open if one of their concepts is active
+                    active_id  = st.session_state.get("current_concept_id")
+                    is_active  = any(cid == active_id for cid, _ in items)
+                    with st.expander(f"📁 {subject} ({len(items)})", expanded=is_active):
+                        for cid, concept_obj in items:
+                            concept_name = concept_obj.get("name", cid)
+                            # Highlight the currently playing concept
+                            label = f"▶ {concept_name}" if cid == active_id else concept_name
+                            if st.button(label, key=f"nav_{cid}",
+                                         use_container_width=True):
+                                st.session_state.current_concept_id = cid
+                                concept_data = concept_obj.copy()
 
-            if st.button("▶ Start / Reset Puzzle", use_container_width=True, type="primary"):
-                selected_key = concept_keys[selected_idx]
-                st.session_state.current_concept_id = selected_key
-                concept_data = concepts[selected_key].copy()
+                                # Scenario Polymorphism: pick a random variant if available
+                                if "variants" in concept_data:
+                                    variant = random.choice(concept_data["variants"])
+                                    concept_data["story_intro"]               = variant["story_intro"]
+                                    concept_data["verification_scenario"]     = variant["verification_scenario"]
+                                    concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
 
-                # Scenario Polymorphism: pick a random variant if available
-                if "variants" in concept_data:
-                    variant = random.choice(concept_data["variants"])
-                    concept_data["story_intro"]               = variant["story_intro"]
-                    concept_data["verification_scenario"]     = variant["verification_scenario"]
-                    concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
-
-                start_session(concept_data)
-                st.rerun()
+                                start_session(concept_data)
+                                st.rerun()
+            else:
+                st.info("No concepts approved yet. Ask a parent to add some in the Dashboard!", icon="📖")
 
             st.divider()
 
