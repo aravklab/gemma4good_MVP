@@ -367,9 +367,31 @@ Return ONLY a valid JSON object. No markdown. No extra keys.
 }
 """
 
+    # Random setting seed — forces the LLM to produce a different scenario
+    # each click even when the concept and ground truth are identical.
+    settings = [
+        "a school playground",
+        "a birthday party",
+        "a science fair",
+        "a supermarket checkout queue",
+        "a family road trip",
+        "a sports match",
+        "a cooking class",
+        "a camping trip",
+        "a pet shop",
+        "a school lunch table",
+        "a library",
+        "a swimming pool",
+        "a video game store",
+        "a neighbourhood lemonade stand",
+        "a school bus",
+    ]
+    setting_seed = random.choice(settings)
+
     jit_user = (
         f"CONCEPT: {concept_name}\n"
-        f"CORE FACT: {ground_truth_logic}\n\n"
+        f"CORE FACT: {ground_truth_logic}\n"
+        f"SETTING: The persona's confused scenario must be set in or around {setting_seed}.\n\n"
         "Generate the game level JSON:"
     )
 
@@ -1455,24 +1477,17 @@ def main() -> None:
                                 ):
                                     st.session_state.current_concept_id = cid
 
-                                    # Decide whether JIT generation is needed.
-                                    # Legacy knowledge.json concepts already have story_intro;
-                                    # ChromaDB skeleton concepts (JIT) do not.
-                                    has_story = bool(concept_obj.get("story_intro"))
+                                    # Routing logic:
+                                    # - Any concept with ground_truth_logic (ChromaDB skeleton
+                                    #   OR approved full concept) → always JIT so the story is
+                                    #   fresh and different on every click.
+                                    # - Pure legacy knowledge.json concepts (have story_intro but
+                                    #   no ground_truth_logic) → static path with Scenario
+                                    #   Polymorphism variant selection.
+                                    ground_truth = concept_obj.get("ground_truth_logic", "")
 
-                                    if has_story:
-                                        # Legacy path — use concept as-is (Scenario Polymorphism)
-                                        concept_data = concept_obj.copy()
-                                        if "variants" in concept_data:
-                                            variant = random.choice(concept_data["variants"])
-                                            concept_data["story_intro"]               = variant["story_intro"]
-                                            concept_data["verification_scenario"]     = variant["verification_scenario"]
-                                            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
-                                        start_session(concept_data)
-                                        st.rerun()
-                                    else:
-                                        # JIT path — generate story + boss fight on the fly
-                                        ground_truth = concept_obj.get("ground_truth_logic", "")
+                                    if ground_truth:
+                                        # JIT path — always generates a fresh story + setting
                                         concept_data = generate_level_jit(
                                             concept_name, ground_truth, skeleton=concept_obj
                                         )
@@ -1485,6 +1500,16 @@ def main() -> None:
                                                 "Try clicking the level again.",
                                                 icon="❌",
                                             )
+                                    else:
+                                        # Legacy path — use concept as-is (Scenario Polymorphism)
+                                        concept_data = concept_obj.copy()
+                                        if "variants" in concept_data:
+                                            variant = random.choice(concept_data["variants"])
+                                            concept_data["story_intro"]               = variant["story_intro"]
+                                            concept_data["verification_scenario"]     = variant["verification_scenario"]
+                                            concept_data["verification_ground_truth"] = variant["verification_ground_truth"]
+                                        start_session(concept_data)
+                                        st.rerun()
                             else:
                                 st.button(
                                     f"🔒 {concept_name}",
