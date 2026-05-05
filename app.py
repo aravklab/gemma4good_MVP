@@ -1485,9 +1485,10 @@ def main() -> None:
         st.caption("Running on local Ollama · No data leaves your device")
 
         with st.expander("🔊 Audio Settings"):
+            # value= is intentionally omitted — init_session_state() sets the defaults
+            # and Streamlit warns if both value= and session_state[key] are specified
             st.checkbox(
                 "Speak persona responses",
-                value=st.session_state.get("voice_enabled", True),
                 key="voice_enabled",
                 help="The persona reads its messages aloud using your browser's built-in voice engine.",
             )
@@ -1499,7 +1500,6 @@ def main() -> None:
             )
             st.checkbox(
                 "Mic input (speak your answer)",
-                value=st.session_state.get("mic_enabled", False),
                 key="mic_enabled",
                 disabled=not mic_available,
                 help=mic_help,
