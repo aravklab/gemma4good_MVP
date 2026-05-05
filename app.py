@@ -149,14 +149,58 @@ WHISPER_MODEL_PATH = "./whisper_model/base"
 # ---------------------------------------------------------------------------
 
 def load_profile() -> dict:
-    """Load student_profile.json; fall back to a fresh default if missing or corrupt."""
+    """Load student_profile.json; fall back to a fresh default if missing or corrupt.
+
+    Schema
+    ------
+    achievements : dict[concept_id → mastery record]   — concepts the student has mastered
+    needs_help   : dict[concept_id → struggle record]  — concepts abandoned after repeated failure
+    """
     if os.path.exists(PROFILE_FILE):
         try:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as fh:
-                return json.load(fh)
+            data = json.load(open(PROFILE_FILE, "r", encoding="utf-8"))
+            # Back-fill needs_help for profiles written before this field existed
+            data.setdefault("needs_help", {})
+            return data
         except (json.JSONDecodeError, OSError):
             pass
-    return {"student_name": "Explorer", "achievements": {}}
+    return {"student_name": "Explorer", "achievements": {}, "needs_help": {}}
+
+
+def log_concept_struggle(concept_id: str, exit_reason: str = "unknown") -> None:
+    """Record (or increment) a needs_help entry for concept_id.
+
+    Called whenever a session ends without mastery:
+      - kid declines to retry after give_up
+      - clarification dead-end hits the threshold
+      - trigger_retry fires and session is ended
+
+    A mastery win clears the entry via clear_concept_struggle().
+    """
+    profile = st.session_state.get("profile", load_profile())
+    profile.setdefault("needs_help", {})
+
+    # Don't overwrite a mastered concept — mastery always wins
+    if concept_id in profile.get("achievements", {}):
+        return
+
+    entry = profile["needs_help"].get(concept_id, {"attempts": 0, "exit_reason": exit_reason})
+    entry["attempts"]    += 1
+    entry["exit_reason"]  = exit_reason   # update to most recent exit type
+    entry["timestamp"]    = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+    profile["needs_help"][concept_id] = entry
+
+    st.session_state.profile = profile
+    save_profile(profile)
+
+
+def clear_concept_struggle(concept_id: str) -> None:
+    """Remove concept_id from needs_help (called on mastery win or parent unlock)."""
+    profile = st.session_state.get("profile", load_profile())
+    profile.setdefault("needs_help", {})
+    profile["needs_help"].pop(concept_id, None)
+    st.session_state.profile = profile
+    save_profile(profile)
 
 
 def save_profile(profile_data: dict) -> None:
@@ -1065,11 +1109,13 @@ def render_dashboard(knowledge: dict) -> None:
     st.divider()
 
     # ── Summary Metrics ──────────────────────────────────────────────────────
+    needs_help_count = len(st.session_state.profile.get("needs_help", {}))
+
     if achievements:
         total_mastered = len(achievements)
         total_friction = sum(v.get("frustration_triggers", 0) for v in achievements.values())
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("🏆 Concepts Mastered", total_mastered)
         with col2:
@@ -1077,6 +1123,13 @@ def render_dashboard(knowledge: dict) -> None:
                 "😤 Learning Friction",
                 total_friction,
                 help="Total frustration triggers accumulated across all subjects.",
+            )
+        with col3:
+            st.metric(
+                "🆘 Needs Help",
+                needs_help_count,
+                delta=None,
+                help="Concepts the child abandoned — click the section below to review and unlock.",
             )
 
         st.divider()
@@ -1134,6 +1187,66 @@ def render_dashboard(knowledge: dict) -> None:
             "to see analytics appear here.",
             icon="🌱",
         )
+
+    # ── Needs Help Alert ─────────────────────────────────────────────────────
+    needs_help_map = st.session_state.profile.get("needs_help", {})
+    if needs_help_map:
+        st.subheader("🆘 Needs Help")
+        st.caption(
+            "These concepts were abandoned after repeated attempts. "
+            "The child's sidebar button is disabled until you unlock it here."
+        )
+        for nh_id, nh_data in list(needs_help_map.items()):
+            attempts    = nh_data.get("attempts", 1)
+            exit_reason = nh_data.get("exit_reason", "unknown")
+            timestamp   = nh_data.get("timestamp", "—")
+            # Try to resolve a human-readable name
+            concept_name = (
+                knowledge.get("concepts", {}).get(nh_id, {}).get("name")
+                or nh_id.replace("_", " ").title()
+            )
+
+            reason_label = {
+                "give_up":           "🏳️ gave up",
+                "clarification_loop": "🔄 kept asking questions",
+            }.get(exit_reason, exit_reason)
+
+            with st.expander(f"🆘 {concept_name}  —  {attempts} attempt(s)"):
+                col_a, col_b = st.columns([3, 1])
+                with col_a:
+                    st.markdown(
+                        f"**Exit reason:** {reason_label}  \n"
+                        f"**Last attempt:** {timestamp}  \n"
+                        f"**Times stuck:** {attempts}"
+                    )
+                    if attempts >= 2:
+                        home_activity = (
+                            knowledge.get("concepts", {})
+                            .get(nh_id, {})
+                            .get("home_activity", "")
+                        )
+                        if home_activity:
+                            st.info(
+                                f"💡 **Suggested home activity:** {home_activity}",
+                                icon="🏠",
+                            )
+                        else:
+                            st.info(
+                                "💡 **Tip:** Try explaining this concept yourself to the child "
+                                "in everyday language before letting them retry the game.",
+                                icon="🏠",
+                            )
+                with col_b:
+                    if st.button(
+                        "🔓 Unlock",
+                        key=f"unlock_{nh_id}",
+                        use_container_width=True,
+                        help="Removes the 🆘 flag so the child can attempt this concept again.",
+                    ):
+                        clear_concept_struggle(nh_id)
+                        st.success(f"'{concept_name}' unlocked — the child can try again!")
+                        st.rerun()
+        st.divider()
 
     # ── Review Queue (ChromaDB) ───────────────────────────────────────────────
     try:
@@ -1540,11 +1653,14 @@ def main() -> None:
                                     max_mastered_seq = seq
 
                         # ── Pass 2: render with look-ahead buffer ──────────────────────
+                        needs_help_map = st.session_state.profile.get("needs_help", {})
+
                         for cid, concept_obj in items:
-                            concept_name = concept_obj.get("name", cid)
-                            seq          = int(concept_obj.get("sequence_order", 999))
-                            is_mastered  = cid in achievements
-                            is_playing   = cid == active_id
+                            concept_name  = concept_obj.get("name", cid)
+                            seq           = int(concept_obj.get("sequence_order", 999))
+                            is_mastered   = cid in achievements
+                            is_playing    = cid == active_id
+                            is_needs_help = cid in needs_help_map and not is_mastered
 
                             # seq=999 means the concept predates sequencing — treat as unlocked
                             # so legacy / pre-migration concepts are always accessible
@@ -1557,6 +1673,17 @@ def main() -> None:
                             if is_unlocked:
                                 if is_mastered:
                                     icon = "⭐"
+                                elif is_needs_help:
+                                    # Soft-lock: visible but disabled until parent clears it
+                                    attempts = needs_help_map[cid].get("attempts", 1)
+                                    st.button(
+                                        f"🆘 {concept_name}  ({attempts}× stuck)",
+                                        key=f"nav_{cid}",
+                                        use_container_width=True,
+                                        disabled=True,
+                                        help="Ask a parent or teacher for help before trying again.",
+                                    )
+                                    continue   # skip the normal button / load logic below
                                 elif is_playing:
                                     icon = "▶"
                                 else:
@@ -1733,6 +1860,16 @@ def main() -> None:
                     "role":    "system",
                     "content": "Session ended gracefully. You did a great job trying! 🌟",
                 })
+                # Telemetry — log the struggle so the Parent Dashboard can see it
+                concept_id = st.session_state.get(
+                    "current_concept_id",
+                    (st.session_state.concept_data or {}).get("name", "unknown"),
+                )
+                exit_reason = (
+                    "clarification_loop" if st.session_state.clarification_counter >= 2
+                    else "give_up"
+                )
+                log_concept_struggle(concept_id, exit_reason=exit_reason)
                 st.rerun()
         st.stop()
 
@@ -1877,6 +2014,8 @@ def main() -> None:
                     "frustration_triggers": st.session_state.frustration_counter,
                     "boss_fight_attempts":  st.session_state.boss_fight_attempts,
                 }
+                # Mastery clears any previous needs_help entry for this concept
+                clear_concept_struggle(concept_id)
                 save_profile(st.session_state.profile)
 
                 win_msg = (
@@ -1941,7 +2080,18 @@ def main() -> None:
                 st.session_state.messages.append({"role": "assistant", "content": pip_response})
                 st.session_state.pips_last_question = pip_response
 
-                # Both explicit give_up and clarification dead-end surface the retry UI
+                # Both explicit give_up and clarification dead-end surface the retry UI.
+                # For trigger_retry (clarification loop) we pre-log the struggle immediately
+                # so the parent can see it even if the kid closes the browser at the prompt.
+                # give_up is only logged if the kid actually declines to retry (the "No, I'm done"
+                # button handler above), because they might choose to try again.
+                if trigger_retry:
+                    cid = st.session_state.get(
+                        "current_concept_id",
+                        (st.session_state.concept_data or {}).get("name", "unknown"),
+                    )
+                    log_concept_struggle(cid, exit_reason="clarification_loop")
+
                 if classification == "give_up" or trigger_retry:
                     st.session_state.awaiting_retry = True
 
