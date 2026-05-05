@@ -175,8 +175,14 @@ def log_concept_struggle(concept_id: str, exit_reason: str = "unknown") -> None:
       - clarification dead-end hits the threshold
       - trigger_retry fires and session is ended
 
-    A mastery win clears the entry via clear_concept_struggle().
+    If the entry was previously status='resolved' (parent had unlocked it for a
+    retry), failing again re-locks it back to status='active' and increments the
+    attempt counter — the parent must intervene again.
+
+    A mastery win retires the entry entirely via retire_concept_struggle().
     """
+    import datetime
+
     profile = st.session_state.get("profile", load_profile())
     profile.setdefault("needs_help", {})
 
@@ -184,18 +190,48 @@ def log_concept_struggle(concept_id: str, exit_reason: str = "unknown") -> None:
     if concept_id in profile.get("achievements", {}):
         return
 
-    entry = profile["needs_help"].get(concept_id, {"attempts": 0, "exit_reason": exit_reason})
+    entry = profile["needs_help"].get(concept_id, {"attempts": 0})
     entry["attempts"]    += 1
-    entry["exit_reason"]  = exit_reason   # update to most recent exit type
-    entry["timestamp"]    = __import__("datetime").datetime.now().isoformat(timespec="seconds")
-    profile["needs_help"][concept_id] = entry
+    entry["exit_reason"]  = exit_reason
+    entry["status"]       = "active"          # (re-)lock regardless of previous state
+    entry["timestamp"]    = datetime.datetime.now().isoformat(timespec="seconds")
+    # Clear any resolved metadata so the parent sees fresh context
+    entry.pop("resolved_at", None)
 
+    profile["needs_help"][concept_id] = entry
     st.session_state.profile = profile
     save_profile(profile)
 
 
-def clear_concept_struggle(concept_id: str) -> None:
-    """Remove concept_id from needs_help (called on mastery win or parent unlock)."""
+def resolve_concept_struggle(concept_id: str) -> None:
+    """Mark concept_id as 'resolved' (parent has intervened and unlocked it).
+
+    Does NOT delete the entry — the attempt history is preserved so the JIT
+    generator can inject a narrative continuity directive on the next attempt,
+    and the parent dashboard can see the full journey.
+
+    State transition:  active → resolved
+    The concept's sidebar button changes from 🆘 (disabled) to 🔄 (enabled).
+    """
+    import datetime
+
+    profile = st.session_state.get("profile", load_profile())
+    profile.setdefault("needs_help", {})
+    entry = profile["needs_help"].get(concept_id)
+    if entry:
+        entry["status"]      = "resolved"
+        entry["resolved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        profile["needs_help"][concept_id] = entry
+        st.session_state.profile = profile
+        save_profile(profile)
+
+
+def retire_concept_struggle(concept_id: str) -> None:
+    """Fully remove concept_id from needs_help after a mastery win.
+
+    Called only on TRUE WIN — mastery after a retry.  The achievement record
+    will carry was_retry=True so the parent dashboard can celebrate a comeback.
+    """
     profile = st.session_state.get("profile", load_profile())
     profile.setdefault("needs_help", {})
     profile["needs_help"].pop(concept_id, None)
@@ -368,9 +404,10 @@ If the source text does not contain enough content for even one meaningful conce
 
 
 def generate_level_jit(
-    concept_name:      str,
+    concept_name:       str,
     ground_truth_logic: str,
-    skeleton:          dict | None = None,
+    skeleton:           dict | None = None,
+    retry_context:      dict | None = None,
 ) -> dict | None:
     """
     Just-In-Time level generator.
@@ -433,10 +470,32 @@ Return ONLY a valid JSON object. No markdown. No extra keys.
     ]
     setting_seed = random.choice(settings)
 
+    # Build optional narrative continuity block for retries after parent intervention
+    continuity_block = ""
+    if retry_context:
+        attempts    = retry_context.get("attempts", 1)
+        exit_reason = retry_context.get("exit_reason", "unknown")
+        reason_txt  = (
+            "gave up after repeated attempts"
+            if exit_reason == "give_up"
+            else "kept asking questions and got stuck in a loop"
+        )
+        continuity_block = (
+            f"\n### NARRATIVE CONTINUITY (RETRY SESSION):\n"
+            f"This student attempted '{concept_name}' before and {reason_txt} "
+            f"({attempts} attempt(s)). A parent or teacher has since explained it "
+            f"to them in real life.\n"
+            f"The persona MUST open with a brief, warm acknowledgement that they "
+            f"were both confused about this before — e.g. 'Hey! Remember how we "
+            f"got super stuck on this? I've been thinking about it...' — and then "
+            f"re-engage with the puzzle. Do NOT restart as if it is the first time.\n"
+        )
+
     jit_user = (
         f"CONCEPT: {concept_name}\n"
         f"CORE FACT: {ground_truth_logic}\n"
-        f"SETTING: The persona's confused scenario must be set in or around {setting_seed}.\n\n"
+        f"SETTING: The persona's confused scenario must be set in or around {setting_seed}.\n"
+        f"{continuity_block}\n"
         "Generate the game level JSON:"
     )
 
@@ -1140,7 +1199,7 @@ def render_dashboard(knowledge: dict) -> None:
         table_rows = [
             {
                 "Concept":              concepts_map.get(cid, {}).get("name", cid),
-                "Status":               data.get("status", "Unknown"),
+                "Status":               ("🔄 Comeback!" if data.get("was_retry") else "⭐ Mastered"),
                 "Frustration Triggers": data.get("frustration_triggers", 0),
                 "Boss Fight Attempts":  data.get("boss_fight_attempts", 0),
             }
@@ -1193,59 +1252,93 @@ def render_dashboard(knowledge: dict) -> None:
     if needs_help_map:
         st.subheader("🆘 Needs Help")
         st.caption(
-            "These concepts were abandoned after repeated attempts. "
-            "The child's sidebar button is disabled until you unlock it here."
+            "Concepts the child abandoned after repeated attempts. "
+            "**🆘 Active** = locked until you intervene. "
+            "**🔄 Awaiting retry** = you've unlocked it — the child hasn't played it yet."
         )
-        for nh_id, nh_data in list(needs_help_map.items()):
-            attempts    = nh_data.get("attempts", 1)
-            exit_reason = nh_data.get("exit_reason", "unknown")
-            timestamp   = nh_data.get("timestamp", "—")
-            # Try to resolve a human-readable name
-            concept_name = (
+
+        def _resolve_concept_name(nh_id: str) -> str:
+            return (
                 knowledge.get("concepts", {}).get(nh_id, {}).get("name")
                 or nh_id.replace("_", " ").title()
             )
 
-            reason_label = {
-                "give_up":           "🏳️ gave up",
-                "clarification_loop": "🔄 kept asking questions",
-            }.get(exit_reason, exit_reason)
+        reason_labels = {
+            "give_up":            "🏳️ gave up after hearing the answer",
+            "clarification_loop": "🔁 kept asking questions and got stuck",
+        }
 
-            with st.expander(f"🆘 {concept_name}  —  {attempts} attempt(s)"):
+        for nh_id, nh_data in list(needs_help_map.items()):
+            attempts    = nh_data.get("attempts", 1)
+            exit_reason = nh_data.get("exit_reason", "unknown")
+            timestamp   = nh_data.get("timestamp", "—")
+            nh_status   = nh_data.get("status", "active")
+            resolved_at = nh_data.get("resolved_at", "—")
+            cname       = _resolve_concept_name(nh_id)
+            reason_lbl  = reason_labels.get(exit_reason, exit_reason)
+
+            if nh_status == "active":
+                expander_label = f"🆘 {cname}  —  {attempts} attempt(s)"
+            else:
+                expander_label = f"🔄 {cname}  —  awaiting retry  ({attempts} attempt(s))"
+
+            with st.expander(expander_label):
                 col_a, col_b = st.columns([3, 1])
                 with col_a:
                     st.markdown(
-                        f"**Exit reason:** {reason_label}  \n"
-                        f"**Last attempt:** {timestamp}  \n"
-                        f"**Times stuck:** {attempts}"
+                        f"**Last exit:** {reason_lbl}  \n"
+                        f"**Times stuck:** {attempts}  \n"
+                        f"**Last attempt:** {timestamp}"
+                        + (f"  \n**Unlocked at:** {resolved_at}" if nh_status == "resolved" else "")
                     )
-                    if attempts >= 2:
-                        home_activity = (
-                            knowledge.get("concepts", {})
-                            .get(nh_id, {})
-                            .get("home_activity", "")
-                        )
+                    home_activity = (
+                        knowledge.get("concepts", {}).get(nh_id, {}).get("home_activity", "")
+                    )
+                    if nh_status == "active":
                         if home_activity:
                             st.info(
-                                f"💡 **Suggested home activity:** {home_activity}",
+                                f"💡 **Suggested home activity before unlocking:** {home_activity}",
                                 icon="🏠",
                             )
                         else:
                             st.info(
-                                "💡 **Tip:** Try explaining this concept yourself to the child "
-                                "in everyday language before letting them retry the game.",
+                                "💡 **Tip:** Explain this concept to the child in everyday language "
+                                "before clicking Unlock — the game will open with Pip acknowledging "
+                                "they were confused about it before.",
                                 icon="🏠",
                             )
+                    else:
+                        st.success(
+                            "✅ You've unlocked this concept. The child's sidebar now shows a 🔄 "
+                            "button. When they click it, the persona will open by acknowledging "
+                            "their previous struggle — it won't feel like a reset.",
+                            icon="🔄",
+                        )
+
                 with col_b:
-                    if st.button(
-                        "🔓 Unlock",
-                        key=f"unlock_{nh_id}",
-                        use_container_width=True,
-                        help="Removes the 🆘 flag so the child can attempt this concept again.",
-                    ):
-                        clear_concept_struggle(nh_id)
-                        st.success(f"'{concept_name}' unlocked — the child can try again!")
-                        st.rerun()
+                    if nh_status == "active":
+                        if st.button(
+                            "🔓 Unlock",
+                            key=f"unlock_{nh_id}",
+                            use_container_width=True,
+                            help="Marks as resolved — child's 🆘 button becomes 🔄 and Pip opens with continuity.",
+                        ):
+                            resolve_concept_struggle(nh_id)
+                            st.success(f"'{cname}' unlocked — child can retry with narrative continuity!")
+                            st.rerun()
+                    else:
+                        st.caption("Waiting for child to retry…")
+                        if st.button(
+                            "🔒 Re-lock",
+                            key=f"relock_{nh_id}",
+                            use_container_width=True,
+                            help="Lock the concept again if the child needs more preparation.",
+                        ):
+                            nh_data["status"] = "active"
+                            nh_data.pop("resolved_at", None)
+                            st.session_state.profile["needs_help"][nh_id] = nh_data
+                            save_profile(st.session_state.profile)
+                            st.rerun()
         st.divider()
 
     # ── Review Queue (ChromaDB) ───────────────────────────────────────────────
@@ -1660,7 +1753,9 @@ def main() -> None:
                             seq           = int(concept_obj.get("sequence_order", 999))
                             is_mastered   = cid in achievements
                             is_playing    = cid == active_id
-                            is_needs_help = cid in needs_help_map and not is_mastered
+                            nh_entry      = needs_help_map.get(cid, {})
+                            nh_status     = nh_entry.get("status", "")        # "active" | "resolved" | ""
+                            is_needs_help = bool(nh_entry) and not is_mastered
 
                             # seq=999 means the concept predates sequencing — treat as unlocked
                             # so legacy / pre-migration concepts are always accessible
@@ -1673,9 +1768,9 @@ def main() -> None:
                             if is_unlocked:
                                 if is_mastered:
                                     icon = "⭐"
-                                elif is_needs_help:
-                                    # Soft-lock: visible but disabled until parent clears it
-                                    attempts = needs_help_map[cid].get("attempts", 1)
+                                elif is_needs_help and nh_status == "active":
+                                    # Hard soft-lock: visible but disabled; parent must intervene
+                                    attempts = nh_entry.get("attempts", 1)
                                     st.button(
                                         f"🆘 {concept_name}  ({attempts}× stuck)",
                                         key=f"nav_{cid}",
@@ -1684,6 +1779,9 @@ def main() -> None:
                                         help="Ask a parent or teacher for help before trying again.",
                                     )
                                     continue   # skip the normal button / load logic below
+                                elif is_needs_help and nh_status == "resolved":
+                                    # Parent unlocked — show as a retry with distinct icon
+                                    icon = "🔄"
                                 elif is_playing:
                                     icon = "▶"
                                 else:
@@ -1706,9 +1804,23 @@ def main() -> None:
                                     ground_truth = concept_obj.get("ground_truth_logic", "")
 
                                     if ground_truth:
-                                        # JIT path — always generates a fresh story + setting
+                                        # JIT path — always generates a fresh story + setting.
+                                        # Pass retry_context if this concept was previously
+                                        # abandoned and the parent has since resolved it, so
+                                        # the persona opens with narrative continuity.
+                                        nh_entry    = st.session_state.profile.get(
+                                            "needs_help", {}
+                                        ).get(cid)
+                                        retry_ctx   = (
+                                            nh_entry
+                                            if nh_entry and nh_entry.get("status") == "resolved"
+                                            else None
+                                        )
                                         concept_data = generate_level_jit(
-                                            concept_name, ground_truth, skeleton=concept_obj
+                                            concept_name,
+                                            ground_truth,
+                                            skeleton      = concept_obj,
+                                            retry_context = retry_ctx,
                                         )
                                         if concept_data:
                                             start_session(concept_data)
@@ -2009,13 +2121,18 @@ def main() -> None:
                     "current_concept_id",
                     concept_data.get("name", "Unknown_Concept"),
                 )
+                # Check if this was a comeback win (resolved struggle → mastery)
+                nh_entry  = st.session_state.profile.get("needs_help", {}).get(concept_id, {})
+                was_retry = nh_entry.get("status") == "resolved"
+
                 st.session_state.profile["achievements"][concept_id] = {
                     "status":               "Mastered",
                     "frustration_triggers": st.session_state.frustration_counter,
                     "boss_fight_attempts":  st.session_state.boss_fight_attempts,
+                    "was_retry":            was_retry,   # True = mastered after parent intervention
                 }
-                # Mastery clears any previous needs_help entry for this concept
-                clear_concept_struggle(concept_id)
+                # Fully retire the struggle record — mastery is the terminal state
+                retire_concept_struggle(concept_id)
                 save_profile(st.session_state.profile)
 
                 win_msg = (
