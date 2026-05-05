@@ -1654,16 +1654,20 @@ def main() -> None:
                 recording_color="#e84118",
                 neutral_color="#353b48",
                 icon_size="2x",
+                pause_threshold=4.0,   # wait 4 s of silence before auto-stop (default 2s cut kids off mid-thought)
                 key="mic_recorder",
             )
+        # Instruction label — shows when no transcription is pending
+        st.caption("🔴 **Recording:** Click mic → speak → click again to stop &nbsp;|&nbsp; Auto-stops after 4 s of silence")
+
         # Typed input wins; fall back to transcribed voice
         if user_text:
             user_input = user_text
         elif audio_bytes:
-            with st.spinner("Listening..."):
+            with st.spinner("Transcribing..."):
                 user_input = transcribe_audio(audio_bytes)
             if user_input:
-                st.caption(f"Heard: *{user_input}*")
+                st.info(f"🎤 Heard: *\"{user_input}\"*", icon="✅")
     else:
         user_input = st.chat_input(f"Explain it to {persona_name}...")
 
