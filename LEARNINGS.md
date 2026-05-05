@@ -189,9 +189,60 @@ Dispatching transcribed text directly into the AI pipeline (common pattern) mean
 
 ---
 
-## 11. Things We Would Do Differently
+## 11. LLM Prompt Evaluation & Guardrails
+
+### 11.1 Evaluate before implementing AI-suggested code
+When an external prompt or AI suggestion proposes an implementation, always read the existing code first. In one instance, a detailed "safe implementation" was proposed for the Narrative Continuity Directive — but the feature had already been built with a richer design (passing the full `retry_context` dict rather than a boolean `is_retry` flag). Implementing the suggestion would have been a regression. Read before you write.
+
+### 11.2 Conditional prompt injection is the right pattern for optional LLM context
+For features that only apply in specific states (e.g., retry sessions), the correct pattern is:
+```python
+optional_block = ""
+if condition:
+    optional_block = "..."
+prompt = f"...{optional_block}..."
+```
+When `condition` is False, the LLM receives the identical prompt as always — zero risk of dilution or drift. Never add context unconditionally "just in case."
+
+### 11.3 Richer context is better than a boolean flag
+Passing `retry_context: dict | None` (containing `attempts`, `exit_reason`, `timestamp`) to the JIT generator is strictly better than `is_retry: bool`. The LLM can tailor the persona's acknowledgement — "we got stuck because you kept asking questions" vs "we got stuck because you gave up" — rather than producing a generic "remember when we tried this before?" line. When you have the data, use it.
+
+### 11.4 Token cost of conditional blocks is negligible for local models
+A typical Narrative Continuity Directive is ~50–60 tokens. A 7B/8B local model has a 128K context window. Context size is not the risk. Instruction dilution — too many constraints causing the model to drop one — is the real risk, and it is managed by: (a) keeping the block short, (b) placing it at the end of the user prompt (recency bias), and (c) using a clear section heading as a visual delimiter for the attention mechanism.
+
+### 11.5 Verify proposed implementations against what already exists
+"Instruction dilution" and "recency bias" are real concerns worth knowing about. But the value of an evaluation is in checking whether the proposed solution is actually needed — not in implementing it reflexively. The best response to a well-reasoned proposal is sometimes "we already did this, and better."
+
+---
+
+## 12. Project Maturity Assessment (End of Audio + State Machine Sprint)
+
+### 12.1 What is genuinely strong
+- **Two-agent architecture** (silent Evaluator + Persona actor) is the correct design; a single agent in both roles leaks answers due to model helpfulness bias
+- **Struggle state machine** (`active → resolved → mastered`) with frustration escalation, clarification dead-end exit, and narrative continuity on retry is sophisticated and pedagogically sound
+- **Privacy-first local stack** (Ollama + ChromaDB + Whisper) is the only acceptable design for a product handling children's learning data
+- **JIT architecture** separates ingestion speed from story quality; random setting seeds prevent content repetition
+- **Documentation** (`ARCHITECTURE.md`, `README.md`, `LEARNINGS.md`) is production-grade and enables future contributors to get up to speed without re-discovering mistakes
+
+### 12.2 The real weaknesses
+- **No LLM retry logic** — every `call_ollama()` call is single-attempt; one bad response silently returns `None` or defaults to `"miss"`. At scale this is the highest-frequency UX failure.
+- **Single-student profile** — `student_profile.json` has no student key. A second child requires a code change, not a settings change.
+- **No session history** — the parent dashboard shows aggregate friction but no timeline. A child's journey is invisible unless it ends in mastery or a needs_help flag.
+- **No content quality floor** — a parent can approve a concept with malformed `boss_fight_logic`. The Evaluator will silently fail to detect mastery against nonsense ground truth.
+- **Whisper base model struggles with accents** — `language="en"` + base model (~145 MB) is not robust to regional accents, code-switching, or fast speech.
+
+### 12.3 Priority order for next sprint
+1. **LLM call retry with fallback** — 2-attempt retry on every `call_ollama()` before returning `None`. Highest impact, lowest effort.
+2. **Multi-student profiles** — keyed profile file + sidebar switcher. ~2 hours of work that unlocks the product for real families.
+3. **Session log (JSONL)** — append one entry per session (concept, phase reached, miss count, outcome, timestamp). Gives the parent a timeline and creates a dataset for future prompt improvement.
+
+---
+
+## 13. Things We Would Do Differently
 
 - **Start with ChromaDB from day one.** Migrating from `knowledge.json` to ChromaDB mid-project required rewriting both the ingestion pipeline and the review queue UI. Designing around a vector store from the start would have been cleaner.
 - **Design the review queue before the ingestion pipeline.** The first version of `ingest.py` wrote directly to disk with no review step. Retroactively adding a `pending` gate required refactoring both ends.
 - **Test with bad PDFs early.** Scanned images, copy-protected files, and tables-only documents all produce edge-case failures that reveal weak spots in the pipeline. Including them in early testing would have surfaced the fail-fast guardrail need sooner.
 - **Pin the virtual environment path in a `Makefile` or `justfile`.** Managing `pip install` across multiple Python installations on Windows caused repeated `ModuleNotFoundError` issues. A single `make install` target pointing at the correct interpreter would eliminate the problem.
+- **Design for multi-student from the first commit.** Adding a student key to `student_profile.json` from day one costs nothing. Retrofitting it later requires migrating existing profile files and updating every read/write call.
+- **Add LLM retry logic before shipping any feature that depends on it.** Every feature that calls `call_ollama()` is implicitly fragile until there is a retry wrapper. Build the wrapper first, then build features on top of it.
