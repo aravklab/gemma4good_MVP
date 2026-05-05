@@ -13,3 +13,6 @@ chroma_db/
 
 # Test / sample PDFs
 *.pdf
+
+# Local Whisper model bundle (~145 MB, run scripts/download_whisper_model.py to populate)
+whisper_model/

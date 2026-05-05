@@ -130,12 +130,17 @@ OLLAMA_URL       = "http://localhost:11434/api/generate"
 MODEL_NAME       = "gemma4:e4b"
 EMBED_MODEL      = "nomic-embed-text"
 TIMEOUT_SECS     = 120
-PROFILE_FILE     = "student_profile.json"
-KNOWLEDGE_FILE   = "knowledge.json"
+PROFILE_FILE      = "student_profile.json"
+KNOWLEDGE_FILE    = "knowledge.json"
 CHROMA_PATH       = "./chroma_db"
 CHROMA_COLLECTION = "curriculum"
 DLQ_FILE          = "rejected_telemetry.jsonl"  # Dead Letter Queue — one JSON record per line
 PDF_MIN_CHARS     = 500            # fail-fast guardrail threshold
+
+# Local Whisper model path — populated by scripts/download_whisper_model.py
+# Change "base" to "small", "medium", etc. after running the download script
+# with --model <size> to use a higher-quality model.
+WHISPER_MODEL_PATH = "./whisper_model/base"
 
 
 # ---------------------------------------------------------------------------
@@ -788,44 +793,34 @@ def start_session(concept_data: dict) -> None:
 @st.cache_resource
 def _load_whisper():
     """
-    Load the faster-whisper base model once and cache it for the lifetime of
-    the Streamlit server process.  Called lazily so the app starts instantly
-    even if the model has not been downloaded yet.
-    compute_type="int8" halves RAM usage on CPU with negligible accuracy loss.
+    Load the faster-whisper model from the local bundle at WHISPER_MODEL_PATH.
+    No network calls are made at runtime — the model must be pre-downloaded
+    by running:  python scripts/download_whisper_model.py
 
-    Corporate SSL note: huggingface_hub uses httpx internally, which does NOT
-    respect the REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE env variables.
-    We use huggingface_hub.configure_http_backend() to inject an httpx.Client
-    with verify=False so the one-time model download works behind SSL-inspection
-    proxies (common on corporate Cisco networks).
-    This override is scoped to huggingface_hub only and does not affect Ollama.
+    To use a larger/better model:
+      1. python scripts/download_whisper_model.py --model small   (or medium/large-v3)
+      2. Update WHISPER_MODEL_PATH at the top of this file to match.
+
+    compute_type="int8" halves RAM usage on CPU with negligible accuracy loss.
     """
     if not FASTER_WHISPER_AVAILABLE:
         return None
-    try:
-        import httpx
-        import huggingface_hub
-        # Inject an SSL-verification-disabled httpx client for the model download
-        huggingface_hub.configure_http_backend(
-            backend_factory=lambda: httpx.Client(verify=False)
+
+    model_path = os.path.abspath(WHISPER_MODEL_PATH)
+
+    if not os.path.isdir(model_path) or not os.listdir(model_path):
+        st.warning(
+            "**Whisper model not found.** Run the one-time download script first:\n\n"
+            "```\npython scripts/download_whisper_model.py\n```\n\n"
+            "Then restart the app. The model is stored locally and never "
+            "needs to be downloaded again."
         )
-    except (ImportError, AttributeError):
-        # Older huggingface_hub (<0.23) — fall back to env-var approach
-        os.environ["CURL_CA_BUNDLE"]     = ""
-        os.environ["REQUESTS_CA_BUNDLE"] = ""
+        return None
 
     try:
-        return _WhisperModel("base", device="cpu", compute_type="int8")
+        return _WhisperModel(model_path, device="cpu", compute_type="int8")
     except Exception as exc:
-        st.warning(
-            f"Could not load Whisper model: {exc}\n\n"
-            "The model download failed. This is usually a corporate SSL proxy issue. "
-            "If the problem persists, run this once in a terminal to pre-download the model:\n\n"
-            "```\npython -c \"import ssl; ssl._create_default_https_context = "
-            "ssl._create_unverified_context; "
-            "from huggingface_hub import snapshot_download; "
-            "snapshot_download('Systran/faster-whisper-base')\"\n```"
-        )
+        st.warning(f"Could not load Whisper model from `{model_path}`: {exc}")
         return None
 
 
