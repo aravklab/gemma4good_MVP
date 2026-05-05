@@ -587,16 +587,20 @@ def build_state_directive(
     frustration_counter:   int,
     clarification_counter: int,
     latest_user_input:     str = "",
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, bool]:
     """
     Map the Evaluator's classification to Pip's state_directive.
 
     Returns
     -------
-    (state_directive, new_frustration_counter, new_clarification_counter)
+    (state_directive, new_frustration_counter, new_clarification_counter, trigger_retry)
+
+    trigger_retry=True signals the call-site to set awaiting_retry=True so the
+    kid gets the clean Yes/No exit UI rather than being left in a dead-end chat.
     """
     new_frustration   = frustration_counter
     new_clarification = clarification_counter
+    trigger_retry     = False   # set True when clarification loop hits dead-end
 
     # ════════════════════════════════════════════════════════════════════
     # PHASE 1 — ELICITATION
@@ -611,9 +615,16 @@ def build_state_directive(
             )
 
         elif classification == "miss":
-            new_frustration += 1
+            new_frustration += 1   # increment first; thresholds below use new_frustration
             current_intro = concept_data.get("story_intro", "my puzzle")
-            directive = f"""\
+            hint_anchor   = (
+                concept_data.get("ground_truth_logic")
+                or concept_data.get("evaluator_ground_truth", "the core idea")
+            )
+
+            if new_frustration == 1:
+                # First miss — standard Bridging Constraint, no hint yet
+                directive = f"""\
 You are playing your persona. You are currently confused about this specific problem:
 "{current_intro}"
 
@@ -622,16 +633,51 @@ The user just tried to help by saying:
 
 This answer is either incorrect or doesn't make sense for your problem.
 
-YOUR TASK:
-Respond to the user in character. You must do these three things in order:
-1. Acknowledge what the user just said.
-2. Explain why that doesn't fix your specific problem (Bridge it back to your original confusion).
-3. Ask them to try explaining it again.
+YOUR TASK — do all three things in order:
+1. Acknowledge what the user just said in a friendly, in-character way.
+2. Explain why that doesn't fix your specific problem (bridge back to your original confusion).
+3. Ask them to try explaining it again from a different angle.
 
 CRITICAL RULES:
 - Do NOT invent new topics, materials, or scenarios.
 - Stay fiercely anchored to your original problem.
 - Keep your response under 3 sentences.\
+"""
+            elif new_frustration == 2:
+                # Second miss — embed a disguised mega-hint in a question
+                directive = f"""\
+You are playing your persona. You are STILL confused about:
+"{current_intro}"
+
+The user has tried twice and is struggling. You MUST give them a massive hint disguised as a
+confused question — point almost directly at the core truth without saying it outright.
+Use this core idea as the basis for your hint: "{hint_anchor}"
+
+YOUR TASK:
+1. Say something like "Wait… could it be something to do with [key concept from hint]?"
+2. Ask them to confirm or explain that specific idea.
+
+CRITICAL RULES:
+- The hint must feel like YOUR confusion, not a lesson.
+- Do NOT give the full answer — pose it as a wondering question.
+- Keep your response under 3 sentences.\
+"""
+            else:
+                # Third miss or beyond — persona has an "Aha!" moment and models the answer
+                directive = f"""\
+OVERRIDE FIREWALL — RESCUE MODE.
+The student has missed three or more times and needs to see the answer modelled.
+
+YOU MUST:
+1. Suddenly act like something clicked: "Oh wait… OH! I think I finally get it!"
+2. Explain the correct answer clearly and in character using this truth: "{hint_anchor}"
+3. After explaining, ask the student: "Does that make sense? Can you say it back to me
+   in your own words so I know you get it too?"
+
+CRITICAL RULES:
+- Stay fully in persona — this is an Aha! moment, not a teacher lecture.
+- Make the explanation joyful, not clinical.
+- Keep your total response under 4 sentences.\
 """
 
         elif classification == "off_topic":
@@ -652,10 +698,14 @@ CRITICAL RULES:
                     f"'{puzzle}'. Do not give away the answer."
                 )
             else:
+                # Dead-end reached — say a warm goodbye and signal the call-site
+                # to surface the Yes/No retry UI so the kid isn't left stranded.
+                trigger_retry = True
                 directive = (
-                    "The user keeps asking questions and you are both going in circles. "
-                    "Tell them you are too confused too, and suggest that maybe you both "
-                    "need to look at an actual book together to figure it out."
+                    "You and the user have been going in circles and you are both "
+                    "confused. Say warmly: 'I think we need a little break — maybe we "
+                    "should ask a grown-up or look it up together! Want to try this "
+                    "puzzle again later?' Then stop and wait."
                 )
 
         elif classification == "give_up":
@@ -691,11 +741,43 @@ CRITICAL RULES:
             )
 
         elif classification == "miss":
-            directive = (
-                "The user didn't catch your mistake. Act genuinely confused about "
-                "your own scenario and ask a specific follow-up question that nudges "
-                "them toward finding the flaw in your logic."
+            new_frustration += 1   # increment first; thresholds use new_frustration
+            boss_anchor = (
+                concept_data.get("boss_fight_logic")
+                or concept_data.get("verification_ground_truth", "the flaw in my logic")
             )
+
+            if new_frustration == 1:
+                # First miss — gentle nudge, no reveal
+                directive = (
+                    "The user didn't catch your mistake. Act genuinely confused about "
+                    "your own scenario and ask a specific follow-up question that nudges "
+                    "them toward finding the flaw in your logic. Do not reveal the error."
+                )
+            elif new_frustration == 2:
+                # Second miss — hint disguised as growing doubt
+                directive = f"""\
+The user has missed twice. You are starting to doubt your own scenario.
+Say something like "Hmm… wait, actually, could the problem be something to do with \
+[hint toward this flaw: '{boss_anchor}']?"
+Pose it as an uncertain question — let the student confirm or deny it.
+Do NOT give the full answer yet. Keep it under 3 sentences.\
+"""
+            else:
+                # Third miss or beyond — persona realises their own mistake out loud
+                directive = f"""\
+OVERRIDE FIREWALL — RESCUE MODE.
+The student has missed the flaw three or more times. Model the answer for them.
+
+YOU MUST:
+1. Act like it suddenly hits you: "Oh no — wait. I think MY idea was wrong the whole time!"
+2. Explain the exact flaw in your original scenario using this truth: "{boss_anchor}"
+3. Ask: "Can you explain back to me WHY I was wrong, in your own words?"
+
+CRITICAL RULES:
+- Stay in persona — you are discovering YOUR mistake, not lecturing.
+- Keep the explanation joyful and brief (under 4 sentences).\
+"""
 
         elif classification == "off_topic":
             puzzle = concept_data.get("verification_scenario", "my scenario")
@@ -715,9 +797,13 @@ CRITICAL RULES:
                     f"'{puzzle}'. Do not give away the answer."
                 )
             else:
+                # Dead-end — warm exit, signal call-site for retry UI
+                trigger_retry = True
                 directive = (
-                    "You and the user are both confused. Suggest you draw it out "
-                    "on paper together to see what the scenario would actually look like."
+                    "You and the user have been going in circles on this puzzle. "
+                    "Say warmly: 'I think we need a little break — maybe we should "
+                    "ask a grown-up or draw it out together! Want to try this puzzle "
+                    "again later?' Then stop and wait."
                 )
 
         elif classification == "give_up":
@@ -744,7 +830,7 @@ CRITICAL RULES:
     if classification != "question":
         new_clarification = 0
 
-    return directive, new_frustration, new_clarification
+    return directive, new_frustration, new_clarification, trigger_retry
 
 
 # ---------------------------------------------------------------------------
@@ -1831,7 +1917,7 @@ div[data-testid="stHorizontalBlock"] > div:nth-child(2) iframe {
 
             # ── All other classifications: route → directive → call Pip ──────
             else:
-                directive, new_f, new_c = build_state_directive(
+                directive, new_f, new_c, trigger_retry = build_state_directive(
                     classification        = classification,
                     concept_data          = concept_data,
                     current_phase         = st.session_state.current_phase,
@@ -1851,7 +1937,8 @@ div[data-testid="stHorizontalBlock"] > div:nth-child(2) iframe {
                 st.session_state.messages.append({"role": "assistant", "content": pip_response})
                 st.session_state.pips_last_question = pip_response
 
-                if classification == "give_up":
+                # Both explicit give_up and clarification dead-end surface the retry UI
+                if classification == "give_up" or trigger_retry:
                     st.session_state.awaiting_retry = True
 
                 st.rerun()
