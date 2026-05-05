@@ -96,6 +96,7 @@ KEY SESSION STATE KEYS
   game_started          True once Start/Reset has been triggered
 """
 
+import hashlib
 import io
 import json
 import os
@@ -774,6 +775,7 @@ def init_session_state() -> None:
         "voice_enabled":   False,  # TTS: off by default — user opts in via Audio Settings
         "mic_enabled":     False,  # STT: show microphone recorder widget
         "last_spoken_idx": -1,     # TTS: index of last message already spoken (avoids replay on rerun)
+        "last_audio_hash": "",     # STT: MD5 of last processed audio — prevents double-submission on rerun
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1660,14 +1662,20 @@ def main() -> None:
         # Instruction label — shows when no transcription is pending
         st.caption("🔴 **Recording:** Click mic → speak → click again to stop &nbsp;|&nbsp; Auto-stops after 4 s of silence")
 
-        # Typed input wins; fall back to transcribed voice
+        # Typed input wins; fall back to transcribed voice.
+        # Guard: hash the audio bytes so a rerun after st.rerun() doesn't
+        # re-submit the same recording a second time (audio_recorder_streamlit
+        # holds its state across reruns until a new recording is made).
         if user_text:
             user_input = user_text
         elif audio_bytes:
-            with st.spinner("Transcribing..."):
-                user_input = transcribe_audio(audio_bytes)
-            if user_input:
-                st.info(f"🎤 Heard: *\"{user_input}\"*", icon="✅")
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            if audio_hash != st.session_state.get("last_audio_hash", ""):
+                st.session_state.last_audio_hash = audio_hash
+                with st.spinner("Transcribing..."):
+                    user_input = transcribe_audio(audio_bytes)
+                if user_input:
+                    st.info(f"🎤 Heard: *\"{user_input}\"*", icon="✅")
     else:
         user_input = st.chat_input(f"Explain it to {persona_name}...")
 
