@@ -1,29 +1,74 @@
 """
-ingest.py - Batch PDF to ChromaDB ingestion pipeline for GemmaGenius
-=====================================================================
-Reads a PDF, chunks it into paragraph blocks, sends each chunk to a
-local Ollama model (gemma4:e4b) to generate structured concept JSON,
-embeds each concept with nomic-embed-text, and upserts it into a local
-ChromaDB vector database.
+ingest.py — GemmaGenius Skeleton Ingestion Pipeline
+====================================================
+PURPOSE
+-------
+Batch-process a PDF into a local ChromaDB vector store, extracting only the
+structural "skeleton" of each concept (title + core fact). No stories, personas,
+or boss fights are generated here — those are produced Just-In-Time by app.py
+when a student clicks a concept.
 
-Usage:
+ARCHITECTURE ROLE
+-----------------
+This script is the WRITE side of the JIT pipeline:
+
+    PDF  →  semantic chunks  →  Ollama (skeleton LLM)
+         →  {concept_name, ground_truth_logic}
+         →  nomic-embed-text embedding
+         →  ChromaDB upsert  (status: "pending")
+         →  Parent reviews in Dashboard
+         →  status: "approved"  →  visible to students
+
+The READ + GENERATE side lives entirely in app.py (generate_level_jit()).
+
+CONCEPT LIFECYCLE
+-----------------
+    pending   →  (parent approves)  →  approved   →  visible in Kid Mode
+              →  (parent rejects)   →  deleted from ChromaDB
+                                       + logged to rejected_telemetry.jsonl
+
+SEQUENCING (Fractional Indexing)
+---------------------------------
+Concepts are ordered using a float: <module>.<concept>
+    e.g.  --module 2  →  concept #3 in that PDF  →  sequence_order = 2.3
+
+This allows multiple PDFs (chapters) to be ingested without renumbering:
+    Chapter 1:  1.1, 1.2, 1.3 …
+    Chapter 2:  2.1, 2.2, 2.3 …
+    Inserted chapter later:  1.5x (manually assigned via repair tool in dashboard)
+
+DEDUPLICATION
+-------------
+IDs are deterministic slugs of the concept name (e.g. "right_angle").
+collection.upsert() means re-ingesting the same PDF is safe — no duplicates.
+
+USAGE
+-----
     python ingest.py <path/to/file.pdf> [options]
 
-Options:
+OPTIONS
+-------
     --dry-run            Print generated JSON to terminal; do NOT embed or write.
-    --model NAME         Ollama generation model (default: gemma4:e4b).
-    --embed-model NAME   Ollama embedding model (default: nomic-embed-text).
-    --chroma-path PATH   Directory for the ChromaDB store (default: ./chroma_db).
-    --collection NAME    ChromaDB collection name (default: curriculum).
-    --max-chars N        Max characters per chunk (default: 3000).
-    --chunk-limit N      Process at most N chunks (default: all).
-    --subject NAME       Subject category tag (default: General).
-    --module N           Major module number for fractional sequencing (default: 1).
-                         Concepts are stored as module.1, module.2, etc.
+    --model NAME         Ollama generation model          (default: gemma4:e4b).
+    --embed-model NAME   Ollama embedding model           (default: nomic-embed-text).
+    --chroma-path PATH   ChromaDB persistence directory   (default: ./chroma_db).
+    --collection NAME    ChromaDB collection name         (default: curriculum).
+    --max-chars N        Max characters per chunk         (default: 3000).
+    --overlap N          Overlap chars between chunks     (default: 300).
+    --chunk-limit N      Process at most N chunks         (default: all).
+    --subject NAME       Subject category tag             (default: General).
+    --module N           Module number for sequencing     (default: 1).
 
-Examples:
-    python ingest.py textbook_chapter.pdf --dry-run
-    python ingest.py notes.pdf --model gemma4:e4b --chunk-limit 3
+EXAMPLES
+--------
+    # Preview without writing
+    python ingest.py chapter1.pdf --dry-run
+
+    # Full Biology module 2 ingestion
+    python ingest.py chapter2.pdf --subject Biology --module 2
+
+    # Limit chunks during development
+    python ingest.py notes.pdf --chunk-limit 3 --dry-run
 """
 
 import argparse

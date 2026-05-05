@@ -1,11 +1,99 @@
 """
-GemmaGenius — Streamlit Web UI  (Pillar A: Persistence & Parent Dashboard)
-==========================================================================
-Dual-view navigation: Kid Mode (chat) and Parent Dashboard (analytics).
-Student progress is persisted to student_profile.json between sessions.
+app.py — GemmaGenius Streamlit Web UI
+======================================
+PURPOSE
+-------
+The main application. Runs the full GemmaGenius learning experience:
+two views (Kid Mode and Parent Dashboard) sharing one Streamlit process.
 
 Run with:
-    streamlit run app.py
+    streamlit run app.py   (from the Gemma4good/ directory)
+
+ARCHITECTURE OVERVIEW
+---------------------
+Two AI units, one local Ollama model, zero cloud calls:
+
+    ┌─────────────────────────────────────────────────────────┐
+    │  KID MODE (Play)            PARENT DASHBOARD            │
+    │  ─────────────────          ─────────────────────────── │
+    │  Subject folder nav         Review Queue (pending)      │
+    │  Look-ahead locking         Active Curriculum manager   │
+    │  JIT level generation       PDF ingestion + sequencing  │
+    │  Two-phase Feynman loop     Analytics + Trophy Room     │
+    │  Trophy Room                Sequence repair tool        │
+    └─────────────────────────────────────────────────────────┘
+
+JIT LEVEL GENERATION (Just-In-Time)
+-------------------------------------
+When a student clicks an unlocked concept, app.py checks whether the concept
+already has a story (legacy knowledge.json) or is a bare skeleton (ChromaDB).
+
+  Skeleton concept (from ingest.py):
+    concept_obj has concept_name + ground_truth_logic only
+    → generate_level_jit() calls Ollama to generate:
+        persona_config, story_intro, verification_scenario,
+        boss_fight_logic, home_activity
+    → every click produces a FRESH story (dynamic re-playability)
+    → merged onto the skeleton dict → start_session()
+
+  Legacy concept (from knowledge.json):
+    concept_obj already has story_intro
+    → used as-is with optional Scenario Polymorphism (random variant)
+    → start_session()
+
+TWO-PHASE GAME LOOP
+-------------------
+Phase 1 — Elicitation
+  Persona presents story_intro and asks the student to explain it.
+  Evaluator grades each response: mastery / partial_hit / miss /
+  question / off_topic / give_up.
+  On mastery → seamless transition to Phase 2.
+
+Phase 2 — Boss Fight (Verification)
+  Persona presents verification_scenario with a deliberate mistake.
+  Student must identify and correct the error.
+  On mastery → TRUE MASTERY ACHIEVED → achievement saved to disk.
+
+DUAL-AGENT DESIGN
+-----------------
+Both agents share the same Ollama model but have completely separate
+system prompts and roles:
+
+  The Evaluator  — silent judge, outputs only {"classification": "…"}
+                   never reveals its verdict to the student
+  The Persona    — actor (Pip / Alex / Riley), never gives answers,
+                   adapts its voice from persona_config in concept_data
+
+SUBJECT-GROUPED SIDEBAR WITH LOOK-AHEAD LOCKING
+-------------------------------------------------
+Concepts are grouped into subject folders (📁 Biology, 📁 Classic …).
+Within each folder, concepts are sorted by sequence_order (float, fractional).
+Locking uses a two-pass look-ahead buffer (LOOK_AHEAD = 3):
+  Pass 1: find the highest mastered sequence in the folder
+  Pass 2: unlock anything with seq <= max_mastered + 3
+  Concepts stored before sequencing (seq=999) are always unlocked.
+
+DATA FLOW
+---------
+  ChromaDB  →  approved concepts  →  merged with knowledge.json legacy
+            →  sidebar folder UI
+            →  JIT generation on click
+            →  st.session_state.concept_data (ephemeral per session)
+
+  student_profile.json  →  achievements (mastery records, keyed by slug ID)
+                        →  Trophy Room display
+                        →  locking gate check (cid in achievements)
+
+KEY SESSION STATE KEYS
+-----------------------
+  messages              Full chat history (list of role/content dicts)
+  current_phase         1 = Elicitation, 2 = Boss Fight
+  concept_data          Active concept dict (populated by JIT or legacy path)
+  current_concept_id    ChromaDB slug ID of the active concept
+  frustration_counter   Phase 1 miss count (used for Bridging Constraint)
+  awaiting_retry        True after give_up — shows Yes/No buttons
+  profile               Student achievements (loaded from student_profile.json)
+  game_started          True once Start/Reset has been triggered
 """
 
 import io

@@ -1,11 +1,55 @@
 """
-GemmaGenius - Layer 1: Core Feynman Loop
-=========================================
-Two logical units, one local model (Ollama):
-  - Pip (The Actor)      : 8-year-old persona with an Information Firewall.
-  - The Evaluator        : Silent background judge; emits strict JSON only.
+main.py — GemmaGenius CLI Interface (Original / Legacy)
+=========================================================
+PURPOSE
+-------
+The original command-line interface for GemmaGenius. Implements the core
+Feynman Technique learning loop as a terminal session. Still fully functional
+but superseded by app.py (Streamlit UI) for day-to-day use.
 
-State is managed with plain Python variables — no agent frameworks.
+Use this for:
+  - Rapid local testing without a browser
+  - Debugging the core two-agent loop in isolation
+  - Running on headless servers without Streamlit
+
+Run with:
+    python main.py   (from the Gemma4good/ directory)
+
+ARCHITECTURE
+------------
+Two logical units sharing one local Ollama model:
+
+  The Evaluator  — silent background judge
+                   reads: student input + ground truth rubric
+                   outputs: strict JSON {"classification": "…"}
+                   classifications: mastery / partial_hit / miss /
+                                    question / off_topic / give_up
+
+  Pip (The Actor) — 8-year-old persona with an Information Firewall
+                    reads: state_directive from routing logic
+                    outputs: in-character response, always ends with a question
+                    NEVER reveals the answer unless state_directive says to
+
+STATE MACHINE (plain Python variables, no frameworks)
+-----------------------------------------------------
+  current_phase         1 = Elicitation, 2 = Boss Fight (Verification)
+  frustration_counter   Phase 1 miss count
+  clarification_counter Consecutive question count
+  boss_fight_attempts   Phase 2 submission count
+  awaiting_retry        True after give_up — prompts Yes/No
+
+DATA SOURCE
+-----------
+Reads from knowledge.json only (does not connect to ChromaDB).
+For the full ChromaDB + JIT pipeline, use app.py instead.
+
+LIMITATIONS vs app.py
+---------------------
+  - No ChromaDB integration (reads knowledge.json only)
+  - No JIT level generation (static pre-written stories only)
+  - No student profile persistence
+  - No subject grouping or look-ahead locking
+  - No parent dashboard
 """
 
 import json
