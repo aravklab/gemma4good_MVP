@@ -295,10 +295,15 @@ def compile_evaluator_prompt(
     phase=1 → grade against evaluator_ground_truth  (Elicitation)
     phase=2 → grade against verification_ground_truth (Boss Fight)
     """
+    # Support both schema generations:
+    #   Legacy (knowledge.json): evaluator_ground_truth / verification_ground_truth
+    #   ChromaDB (ingest.py):    ground_truth_logic      / boss_fight_logic
     ground_truth = (
-        concept_data["verification_ground_truth"]
+        concept_data.get("verification_ground_truth")
+        or concept_data.get("boss_fight_logic", "")
         if phase == 2
-        else concept_data["evaluator_ground_truth"]
+        else concept_data.get("evaluator_ground_truth")
+        or concept_data.get("ground_truth_logic", "")
     )
 
     system_prompt = f"""You are a strict, impartial pedagogical grader.
@@ -446,7 +451,10 @@ CRITICAL RULES:
                 )
 
         elif classification == "give_up":
-            analogy = concept_data.get("secret_fact", "the core concept")
+            analogy = (
+                concept_data.get("secret_fact")
+                or concept_data.get("ground_truth_logic", "the core concept")
+            )
             directive = (
                 f"OVERRIDE FIREWALL: The user is frustrated and gave up. Take a deep "
                 f"breath and gently explain the answer to them in a full, helpful paragraph. "
@@ -505,7 +513,10 @@ CRITICAL RULES:
                 )
 
         elif classification == "give_up":
-            ans = concept_data.get("verification_ground_truth", "why your scenario was wrong")
+            ans = (
+                concept_data.get("verification_ground_truth")
+                or concept_data.get("boss_fight_logic", "why your scenario was wrong")
+            )
             directive = (
                 f"OVERRIDE FIREWALL: The user is frustrated and gave up. Take a deep "
                 f"breath and gently explain exactly why your scenario was wrong in a full, "
