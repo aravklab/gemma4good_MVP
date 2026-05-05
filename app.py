@@ -102,11 +102,24 @@ import os
 import random
 import re
 import requests
+import tempfile
 from datetime import datetime, timezone
 import chromadb
 import ollama
 import streamlit as st
 from pypdf import PdfReader
+
+try:
+    from audio_recorder_streamlit import audio_recorder as _audio_recorder
+    AUDIO_RECORDER_AVAILABLE = True
+except ImportError:
+    AUDIO_RECORDER_AVAILABLE = False
+
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +743,10 @@ def init_session_state() -> None:
         "last_response":              "",     # debug: last raw response from Ollama
         "last_classification":        "None", # debug: last evaluator verdict
         "last_evaluator_rationale":   "None", # debug: raw evaluator JSON before parsing
+        # audio
+        "voice_enabled":   True,   # TTS: persona speaks its responses aloud
+        "mic_enabled":     False,  # STT: show microphone recorder widget
+        "last_spoken_idx": -1,     # TTS: index of last message already spoken (avoids replay on rerun)
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -756,6 +773,7 @@ def start_session(concept_data: dict) -> None:
     st.session_state.session_ended         = False
     st.session_state.session_won           = False
     st.session_state.game_started          = True
+    st.session_state.last_spoken_idx       = -1  # reset TTS pointer for the new session
 
     st.session_state.messages.append({
         "role":    "assistant",
@@ -764,7 +782,82 @@ def start_session(concept_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# F. CHAT HISTORY RENDERER
+# F. AUDIO HELPERS
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _load_whisper():
+    """
+    Load the faster-whisper base model once and cache it for the lifetime of
+    the Streamlit server process.  Called lazily so the app starts instantly
+    even if the model has not been downloaded yet.
+    compute_type="int8" halves RAM usage on CPU with negligible accuracy loss.
+    """
+    if not FASTER_WHISPER_AVAILABLE:
+        return None
+    return _WhisperModel("base", device="cpu", compute_type="int8")
+
+
+def transcribe_audio(audio_bytes: bytes) -> str | None:
+    """
+    Transcribe raw WAV bytes to text using a local faster-whisper model.
+    language="en" skips auto-detection to eliminate latency.
+    Returns the transcribed string, or None on failure / empty audio.
+    """
+    if not audio_bytes or not FASTER_WHISPER_AVAILABLE:
+        return None
+    model = _load_whisper()
+    if model is None:
+        return None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+    try:
+        segments, _ = model.transcribe(tmp_path, beam_size=5, language="en")
+        text = " ".join(s.text for s in segments).strip()
+        return text or None
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def speak_text(text: str, persona_name: str = "Pip") -> None:
+    """
+    Inject a tiny JS snippet that uses the browser's built-in Web Speech API
+    (SpeechSynthesis) to read the persona's message aloud.
+    Runs 100% client-side — no network calls, no Python audio dependencies.
+    Each persona gets a distinct voice profile (pitch + rate).
+    No-ops when voice_enabled is False.
+    """
+    if not st.session_state.get("voice_enabled", True):
+        return
+
+    voice_profiles = {
+        "Pip":   {"pitch": 1.4, "rate": 0.85},
+        "Alex":  {"pitch": 1.1, "rate": 1.0},
+        "Riley": {"pitch": 0.9, "rate": 1.1},
+    }
+    profile = voice_profiles.get(persona_name, {"pitch": 1.0, "rate": 1.0})
+
+    # Escape backticks and backslashes so the text is safe inside a JS template literal
+    safe_text = text.replace("\\", "\\\\").replace("`", "\\`")
+
+    js = f"""
+    <script>
+      (function() {{
+        window.speechSynthesis.cancel();
+        var u = new SpeechSynthesisUtterance(`{safe_text}`);
+        u.pitch = {profile['pitch']};
+        u.rate  = {profile['rate']};
+        window.speechSynthesis.speak(u);
+      }})();
+    </script>
+    """
+    st.components.v1.html(js, height=0)
+
+
+# ---------------------------------------------------------------------------
+# G. CHAT HISTORY RENDERER
 # ---------------------------------------------------------------------------
 
 def get_persona_avatar() -> str:
@@ -783,20 +876,39 @@ def get_persona_avatar() -> str:
     return "👧🏼"
 
 
-def render_chat_history(persona_avatar: str = "👧🏼") -> None:
+def render_chat_history(persona_avatar: str = "👧🏼", persona_name: str = "Pip") -> None:
     """
     Render all messages in st.session_state.messages.
       "assistant" → persona avatar passed in from the active concept's persona_config
       "user"      → student (avatar 👤)
       "system"    → phase/state banners as styled st.info boxes
+
+    TTS: after rendering, speak the latest assistant message if it has not been
+    spoken yet (guarded by last_spoken_idx to prevent re-reading on every rerun).
     """
-    for message in st.session_state.messages:
+    last_spoken_idx = st.session_state.get("last_spoken_idx", -1)
+    latest_assistant_idx = -1
+    latest_assistant_text = ""
+
+    for idx, message in enumerate(st.session_state.messages):
         if message["role"] == "system":
             st.info(message["content"], icon="⚔️")
         else:
             avatar = persona_avatar if message["role"] == "assistant" else "👤"
             with st.chat_message(message["role"], avatar=avatar):
                 st.markdown(message["content"])
+            if message["role"] == "assistant":
+                latest_assistant_idx  = idx
+                latest_assistant_text = message["content"]
+
+    # Speak the latest assistant message only if it is new since the last render
+    if (
+        latest_assistant_idx > last_spoken_idx
+        and latest_assistant_text
+        and st.session_state.get("voice_enabled", True)
+    ):
+        speak_text(latest_assistant_text, persona_name)
+        st.session_state.last_spoken_idx = latest_assistant_idx
 
 
 # ---------------------------------------------------------------------------
@@ -1372,6 +1484,27 @@ def main() -> None:
         st.divider()
         st.caption("Running on local Ollama · No data leaves your device")
 
+        with st.expander("🔊 Audio Settings"):
+            st.checkbox(
+                "Speak persona responses",
+                value=st.session_state.get("voice_enabled", True),
+                key="voice_enabled",
+                help="The persona reads its messages aloud using your browser's built-in voice engine.",
+            )
+            mic_available = AUDIO_RECORDER_AVAILABLE and FASTER_WHISPER_AVAILABLE
+            mic_help = (
+                "Record your answer with the microphone instead of typing."
+                if mic_available
+                else "Install audio-recorder-streamlit and faster-whisper to enable mic input."
+            )
+            st.checkbox(
+                "Mic input (speak your answer)",
+                value=st.session_state.get("mic_enabled", False),
+                key="mic_enabled",
+                disabled=not mic_available,
+                help=mic_help,
+            )
+
         with st.expander("🔧 Developer Settings"):
             debug_mode = st.checkbox("🐛 Enable Debug Mode", value=False, key="debug_mode")
 
@@ -1401,7 +1534,7 @@ def main() -> None:
         st.stop()
 
     # ── Render full chat history ──────────────────────────────────────────────
-    render_chat_history(persona_avatar)
+    render_chat_history(persona_avatar, persona_name)
 
     # ── Win state: show celebration and block further input ───────────────────
     if st.session_state.session_won:
@@ -1456,8 +1589,34 @@ def main() -> None:
                 st.rerun()
         st.stop()
 
-    # ── Chat input ────────────────────────────────────────────────────────────
-    if user_input := st.chat_input(f"Explain it to {persona_name}..."):
+    # ── Chat input (text + optional mic) ──────────────────────────────────────
+    user_input: str | None = None
+
+    if st.session_state.get("mic_enabled") and AUDIO_RECORDER_AVAILABLE:
+        # Side-by-side layout: wide text input + narrow mic button
+        input_col, mic_col = st.columns([6, 1])
+        with input_col:
+            user_text = st.chat_input(f"Explain it to {persona_name}...")
+        with mic_col:
+            audio_bytes = _audio_recorder(
+                text="",
+                recording_color="#e84118",
+                neutral_color="#353b48",
+                icon_size="2x",
+                key="mic_recorder",
+            )
+        # Typed input wins; fall back to transcribed voice
+        if user_text:
+            user_input = user_text
+        elif audio_bytes:
+            with st.spinner("Listening..."):
+                user_input = transcribe_audio(audio_bytes)
+            if user_input:
+                st.caption(f"Heard: *{user_input}*")
+    else:
+        user_input = st.chat_input(f"Explain it to {persona_name}...")
+
+    if user_input:
 
         # 1. Append and immediately display the user's message
         st.session_state.messages.append({"role": "user", "content": user_input})

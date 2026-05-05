@@ -22,3 +22,12 @@ chromadb==1.5.8
 
 # Parent Dashboard dataframe rendering (app.py)
 pandas==3.0.2
+
+# Audio — STT mic recorder widget (app.py)
+# Records audio in the browser and returns WAV bytes to Python
+audio-recorder-streamlit>=0.0.10
+
+# Audio — local Whisper transcription (app.py)
+# Downloads the 'base' model (~145 MB) on first use; runs on CPU
+# Install note on Windows: may require Microsoft C++ Build Tools
+faster-whisper>=1.0.0
