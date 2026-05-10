@@ -2135,9 +2135,10 @@ def main() -> None:
                 retire_concept_struggle(concept_id)
                 save_profile(st.session_state.profile)
 
+                persona_name = concept_data.get("persona_config", {}).get("name", "Pip")
                 win_msg = (
                     "⭐ **TRUE MASTERY ACHIEVED!** ⭐\n\n"
-                    "You explained the concept AND caught Pip's mistake!\n\n"
+                    f"You explained the concept AND caught {persona_name}'s mistake!\n\n"
                     "You explained it so well, even an 8-year-old gets it now. You're a genius! 🎉"
                 )
                 st.session_state.messages.append({"role": "assistant", "content": win_msg})
