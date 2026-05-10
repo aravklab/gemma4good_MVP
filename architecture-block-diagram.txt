@@ -1,0 +1,156 @@
+================================================================================
+GemmaGenius / Gemma4good — ARCHITECTURE (BLOCK DIAGRAM)
+================================================================================
+ASCII blocks below; Mermaid at bottom for tools that render it (e.g. GitHub,
+Mermaid Live Editor). Single machine, no cloud APIs.
+
+--------------------------------------------------------------------------------
+LAYER 0 — USER & RUNTIME
+--------------------------------------------------------------------------------
+
+    +------------------+          +---------------------------+
+    |   Web browser    |  HTTPS   |   Streamlit server        |
+    |   (student /     | <------> |   Python process          |
+    |    parent)       |          |   app.py                  |
+    +------------------+          +-------------+-------------+
+                                                  |
+                    +-----------------------------+-----------------------------+
+                    |                             |                             |
+                    v                             v                             v
+            +---------------+             +---------------+             +---------------+
+            |  Kid Mode     |             |  Parent       |             |  Shared       |
+            |  (Play)       |             |  Dashboard    |             |  services     |
+            |  chat, mic,   |             |  PDF ingest,  |             |  prompts,     |
+            |  sidebar      |             |  queue, seq   |             |  JIT, profile |
+            +---------------+             +---------------+             +---------------+
+
+
+--------------------------------------------------------------------------------
+LAYER 1 — LOCAL SERVICES (PROCESSES)
+--------------------------------------------------------------------------------
+
+    +---------------------------+       +---------------------------+
+    |   Ollama (localhost)      |       |   Optional: faster-whisper  |
+    |   gemma4:e4b (chat/JIT)   |       |   (local STT, on demand)  |
+    |   nomic-embed-text        |       +---------------------------+
+    +---------------------------+
+
+
+--------------------------------------------------------------------------------
+LAYER 2 — DATA & ARTIFACTS (ON DISK)
+--------------------------------------------------------------------------------
+
+    +------------------+    +----------------------+    +------------------------+
+    |  chroma_db/      |    |  student_profile.json|    |  knowledge.json        |
+    |  ChromaDB        |    |  achievements,       |    |  legacy concepts       |
+    |  vectors +       |    |  needs_help, etc.    |    |  (CLI main.py path)    |
+    |  concept metadata|    +----------------------+    +------------------------+
+    +------------------+
+
+    +----------------------+    +---------------------------+
+    |  rejected_telemetry  |    |  ingest.py batch jobs     |
+    |  .jsonl (optional) |    |  PDF -> skeletons -> DB   |
+    +----------------------+    +---------------------------+
+
+
+--------------------------------------------------------------------------------
+LOGICAL DATA FLOW (HIGH LEVEL)
+--------------------------------------------------------------------------------
+
+    [Browser] <--HTTP--> [Streamlit app.py]
+                              |
+         +--------------------+--------------------+--------------------+
+         |                    |                    |                    |
+         v                    v                    v                    v
+   [Ollama HTTP]        [ChromaDB]          [JSON profile]        [Whisper]
+   chat + embed         read/write          achievements          mic path
+
+
+--------------------------------------------------------------------------------
+DUAL-AGENT BLOCK (INSIDE app.py — SAME MODEL, TWO ROLES)
+--------------------------------------------------------------------------------
+
+    +------------------+     verdict JSON      +---------------------------+
+    |  Evaluator       | --------------------> |  build_state_directive()  |
+    |  (system prompt  |                       |  + frustration / clarify  |
+    |   + JSON mode)   |                       +-------------+-------------+
+    +---------+--------+                                     |
+              |                                              v
+              |                                   +----------+-----------+
+              |                                   |  Persona (Pip/Alex/  |
+              |                                   |  Riley) — NL reply   |
+              +---------------------------------->|  (system + directive)|
+                                                  +----------+-----------+
+                                                             |
+                                                             v
+                                                    [st.session_state.messages]
+
+
+--------------------------------------------------------------------------------
+OFFLINE / BATCH PATH (INGESTION)
+--------------------------------------------------------------------------------
+
+    [PDF] --> [ingest.py] --> [Ollama extract skeleton] --> [embed] --> [ChromaDB]
+                                                                    (pending)
+                                           Parent approves in Dashboard
+                                                                    |
+                                                                    v
+                                                              status: approved
+
+
+================================================================================
+MERMAID — same architecture (render in a Mermaid-capable viewer)
+================================================================================
+
+flowchart TB
+  subgraph Client["Layer 0 — Client"]
+    BR[Web browser]
+  end
+
+  subgraph App["Layer 0 — Application"]
+    ST[Streamlit app.py]
+    KM[Kid Mode]
+    PD[Parent Dashboard]
+    ST --> KM
+    ST --> PD
+  end
+
+  subgraph LocalSvc["Layer 1 — Local services"]
+    OL[Ollama\n gemma4:e4b + nomic-embed-text]
+    FW[faster-whisper optional]
+  end
+
+  subgraph Storage["Layer 2 — On-disk"]
+    CH[(chroma_db)]
+    PR[(student_profile.json)]
+    KJ[(knowledge.json legacy)]
+  end
+
+  subgraph Batch["Batch / CLI"]
+    ING[ingest.py]
+    MAIN[main.py CLI legacy]
+  end
+
+  BR <--> ST
+  ST <--> OL
+  ST <--> CH
+  ST <--> PR
+  ST -.-> FW
+  ING --> OL
+  ING --> CH
+  MAIN -.-> KJ
+
+  subgraph DualAgent["Dual-agent inside app.py"]
+    EV[Evaluator\n JSON classification]
+    DIR[build_state_directive]
+    PE[Persona\n natural language]
+    EV --> DIR --> PE
+  end
+
+  ST --> DualAgent
+  OL --> EV
+  OL --> PE
+
+================================================================================
+END
+================================================================================

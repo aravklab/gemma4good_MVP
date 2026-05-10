@@ -1,0 +1,160 @@
+================================================================================
+GemmaGenius / Gemma4good — SIGNALING (SEQUENCE / MESSAGE FLOW)
+================================================================================
+Shows who calls whom and in what order. ASCII timelines first; Mermaid
+sequenceDiagram at the end.
+
+Legend:  -->  synchronous request/response
+         ...  optional or parallel concern
+
+
+--------------------------------------------------------------------------------
+A) ONE STUDENT TURN (TYPED OR SUBMITTED TEXT) — HAPPY PATH
+--------------------------------------------------------------------------------
+
+  Student          Streamlit           Evaluator           Ollama           Directive           Persona
+     |                app.py              (logic)           (gemma)           builder             (logic)
+     |                  |                    |                 |                  |                  |
+     |-- submit msg --->|                    |                 |                  |                  |
+     |                  |-- compile_evaluator_prompt -------->|                  |                  |
+     |                  |                    |-- HTTP chat -->|                  |                  |
+     |                  |                    |<-- JSON -------|                  |                  |
+     |                  |                    |  {classification}               |                  |
+     |                  |-- build_state_directive(classification, counters...) -->|                  |
+     |                  |<-- (directive, new counters, trigger_retry) ---------|                  |
+     |                  |-- compile_pip_prompt(directive) -------------------->|                  |
+     |                  |                    |                 |-- HTTP chat ----------------------->|
+     |                  |                    |                 |<-- assistant text ------------------|
+     |                  |<-- append messages, rerun -----------------------------------------------|
+     |<-- UI refresh ---|                    |                 |                  |                  |
+
+
+--------------------------------------------------------------------------------
+B) PHASE 1 MASTERY → PHASE 2 IN ONE PERSONA CALL (SEAMLESS TRANSITION)
+--------------------------------------------------------------------------------
+
+  Student          app.py              Evaluator           Ollama              Persona prompt
+     |                |                    |                 |                        |
+     |-- answer ----->|                    |                 |                        |
+     |                |-- evaluator call -->|---------------->|                        |
+     |                |<-- mastery -------|<----------------|                        |
+     |                |                    |                 |                        |
+     |                |-- phase := 2, build OVERRIDE directive (boss scenario)        |
+     |                |-- persona call with transition + verification ------------->|
+     |                |                    |                 |<-- single reply -------|
+     |                |-- messages += persona; rerun        |                        |
+
+
+--------------------------------------------------------------------------------
+C) PHASE 2 MASTERY → PERSIST WIN (NO EXTRA PERSONA CALL FOR THE WIN LINE)
+--------------------------------------------------------------------------------
+
+  Student          app.py              Evaluator           Ollama           student_profile.json
+     |                |                    |                 |                        |
+     |-- answer ----->|                    |                 |                        |
+     |                |-- evaluator ----->|---------------->|                        |
+     |                |<-- mastery -------|<----------------|                        |
+     |                |                    |                 |                        |
+     |                |-- write achievements[concept_id] -------------------------->|
+     |                |-- append canned win msg (persona-aware) to messages          |
+     |                |-- session_won, rerun                |                        |
+
+
+--------------------------------------------------------------------------------
+D) CONCEPT CLICK → JIT LEVEL GENERATION (FIRST TIME OR FRESH STORY)
+--------------------------------------------------------------------------------
+
+  Student          app.py              ChromaDB            Ollama              start_session
+     |                |                    |                 |                        |
+     |-- click ------>|                    |                 |                        |
+     |                |-- load skeleton -->|                 |                        |
+     |                |<-- concept -------|                 |                        |
+     |                |-- generate_level_jit() ------------>|                        |
+     |                |                    |                 |-- generate story ----|
+     |                |                    |                 |<-- persona + story ---|
+     |                |-- merge skeleton + JIT output ------------------------------->|
+     |                |-- start_session(merged) ------------------------------------>|
+
+
+--------------------------------------------------------------------------------
+E) PARENT DASHBOARD — APPROVE PENDING CONCEPT (SIMPLIFIED)
+--------------------------------------------------------------------------------
+
+  Parent           app.py              ChromaDB
+     |                |                    |
+     |-- approve ---->|                    |
+     |                |-- update status -->|
+     |                |<-- OK -------------|
+     |<-- UI update --|                    |
+
+
+--------------------------------------------------------------------------------
+F) INGESTION BATCH (CLI) — NOT STREAMLIT
+--------------------------------------------------------------------------------
+
+  Operator         ingest.py           Ollama              ChromaDB
+     |                |                    |                    |
+     |-- PDF path --->|                    |                    |
+     |                |-- extract text    |                    |
+     |                |-- skeleton LLM ->|                    |
+     |                |<-- JSON ---------|                    |
+     |                |-- embed -------->|                    |
+     |                |-- upsert --------------------------->|
+     |<-- done -------|                    |                    |
+
+
+--------------------------------------------------------------------------------
+G) VOICE INPUT PATH (OPTIONAL — HIGH LEVEL)
+--------------------------------------------------------------------------------
+
+  Browser          app.py              faster-whisper        Ollama (same as A)
+     |                |                    |                    |
+     |-- audio blob ->|                    |                    |
+     |                |-- transcribe ---->|                    |
+     |                |<-- text ----------|                    |
+     |                |-- (user confirms) then same as diagram A ------------->|
+
+
+================================================================================
+MERMAID — sequenceDiagram (single turn, simplified)
+================================================================================
+
+sequenceDiagram
+  participant S as Student / Browser
+  participant A as Streamlit app.py
+  participant O as Ollama
+  participant P as Persona reply
+
+  S->>A: User message (text or post-STT)
+  A->>A: compile_evaluator_prompt(...)
+  A->>O: Evaluator chat (JSON mode)
+  O-->>A: {classification}
+  A->>A: build_state_directive(...)
+  A->>A: compile_pip_prompt(directive)
+  A->>O: Persona chat (natural language)
+  O-->>A: Persona assistant text
+  A->>A: Append to messages; rerun
+  A-->>S: Rendered chat + UI
+
+
+================================================================================
+MERMAID — phase-1 mastery to phase-2 (conceptual)
+================================================================================
+
+sequenceDiagram
+  participant S as Student
+  participant A as app.py
+  participant O as Ollama
+
+  S->>A: Phase 1 answer
+  A->>O: Evaluator
+  O-->>A: mastery
+  Note over A: current_phase := 2, frustration reset
+  A->>O: Persona with OVERRIDE / boss scenario
+  O-->>A: Transition + verification prompt
+  A-->>S: Single persona bubble
+
+
+================================================================================
+END
+================================================================================
